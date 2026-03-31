@@ -141,5 +141,4 @@ async def main():
 # 5. 标准 Python 启动入口
 # ======================
 if __name__ == "__main__":
-    # 这里的函数名 main() 必须和上面 async def main() 对应
-    asyncio.run(main)
+    asyncio.run(main())
