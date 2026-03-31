@@ -1,4 +1,7 @@
 requests
 aiohttp
 websockets
+pandas
+numpy
 matplotlib
+python-dotenv
