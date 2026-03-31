@@ -9,8 +9,8 @@ from datetime import datetime
 # 1. 核心环境变量配置
 # ======================
 # 务必在 Railway 的 Variables 页面配置这两个 EXACT 名字的变量
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY")
+CHAT_ID = os.getenv("5739995837")
 
 # ======================
 # 2. 模拟盘参数设置 (根据你的日志同步)
