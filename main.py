@@ -1,91 +1,99 @@
 import asyncio
-import json
-import websockets
+import random
+import requests
 import time
+import os
+from datetime import datetime
 
-from strategy import TailStrategy
-from stats import Stats
-from notify import send
+# ======================
+# 环境变量（Railway）
+# ======================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-MARKETS = {
-    "ETH": "wss://stream.binance.com:9443/ws/ethusdt@trade",
-    "BTC": "wss://stream.binance.com:9443/ws/btcusdt@trade"
-}
+# ======================
+# 配置
+# ======================
+BET_AMOUNT = 10
+INTERVAL = 300  # 5分钟
 
-strategies = {k: TailStrategy() for k in MARKETS}
-stats_map = {k: Stats() for k in MARKETS}
+balance = 10000.0  # 初始资金
+win = 0
+lose = 0
 
-pending_trades = []
+MARKETS = ["BTC", "ETH", "XRP", "SOL", "DOGE", "BNB"]
 
-BET = 10
+# ======================
+# Telegram 推送
+# ======================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": msg
+        })
+    except Exception as e:
+        print("TG error:", e)
 
-async def run_market(name, url):
-    async with websockets.connect(url) as ws:
-        print(f"🟢 {name} 已连接")
+# ======================
+# 模拟交易逻辑
+# ======================
+def simulate_trade():
+    return "win" if random.random() < 0.03 else "lose"
 
-        while True:
-            msg = await ws.recv()
-            data = json.loads(msg)
+async def run_trade_cycle():
+    global balance, win, lose
 
-            price = float(data["p"])
-            strategies[name].update(price)
+    market = random.choice(MARKETS)
+    result = simulate_trade()
 
-            # 触发信号
-            if strategies[name].signal():
-                pending_trades.append({
-                    "market": name,
-                    "entry": price,
-                    "time": time.time()
-                })
+    if result == "win":
+        profit = 1000 - BET_AMOUNT
+        balance += profit
+        win += 1
+    else:
+        balance -= BET_AMOUNT
+        lose += 1
 
-async def settlement_loop():
-    while True:
-        now = time.time()
+    roi = (balance - 10000) / 10000 * 100
 
-        for trade in pending_trades[:]:
-            if now - trade["time"] > 60:
-                market = trade["market"]
-                entry = trade["entry"]
+    msg = f"""
+🦞 龙虾交易报告
 
-                prices = strategies[market].prices[-60:]
+⏰ 时间: {datetime.now().strftime('%H:%M:%S')}
+📊 市场: {market} 5m
 
-                win = max(prices) > entry * 1.003
+🎯 结果: {result.upper()}
+💰 本次下注: {BET_AMOUNT}U
 
-                stats_map[market].record(win)
+📈 胜: {win} | 负: {lose}
+💼 当前余额: {balance:.2f}U
+📊 ROI: {roi:.2f}%
+"""
+    print(msg)
+    send_telegram(msg)
 
-                pending_trades.remove(trade)
+    # 止损保护
+    if balance < 8000:
+        send_telegram("🛑 已触发止损（余额低于8000U），系统暂停运行")
+        os._exit(0)
 
-        await asyncio.sleep(1)
-
-async def report_loop():
-    while True:
-        await asyncio.sleep(300)
-
-        msg = "📊 多市场尾部套利报告\n\n"
-
-        for m, s in stats_map.items():
-            data = s.summary()
-            if not data:
-                continue
-
-            msg += f"【{m}】\n"
-            msg += f"交易: {data['trades']}\n"
-            msg += f"胜率: {data['win_rate']:.2%}\n"
-            msg += f"ROI: {data['roi']:.2f}\n"
-            msg += f"余额: ${data['balance']}\n\n"
-
-        await send(msg)
-        print(msg)
-
+# ======================
+# 主循环
+# ======================
 async def main():
-    tasks = []
+    send_telegram("🚀 龙虾系统启动 | 初始资金 10000U | 已开启止损保护")
 
-    for name, url in MARKETS.items():
-        tasks.append(asyncio.create_task(run_market(name, url)))
+    while True:
+        start_time = asyncio.get_event_loop().time()
+        
+        await run_trade_cycle()
+        
+        # 计算剩余等待时间，确保每5分钟运行一次
+        elapsed = asyncio.get_event_loop().time() - start_time
+        sleep_time = max(0, INTERVAL - elapsed)
+        await asyncio.sleep(sleep_time)
 
-    tasks.append(asyncio.create_task(settlement_loop()))
-    tasks.append(asyncio.create_task(report_loop()))
-
-    await asyncio.gather(*tasks)
-
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
