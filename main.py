@@ -119,4 +119,5 @@ async def main():
         await asyncio.sleep(max(0, INTERVAL - elapsed))
 
 if __name__ == "__main__":
+    asyncio.run(run())
     # 使用标准入口
