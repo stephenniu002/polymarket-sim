@@ -9,8 +9,8 @@ from datetime import datetime
 # 🚀 1. 核心配置区
 # ==========================================
 # Railway 或本地环境变量配置
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY"
-CHAT_ID = os.getenv("CHAT_ID") or "5739995837"
+TELEGRAM_TOKEN = "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY"
+CHAT_ID = "5739995837"
 
 # ==========================================
 # 💰 2. 模拟盘参数
