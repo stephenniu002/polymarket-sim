@@ -122,6 +122,7 @@ async def main():
 # 启动入口（必须有）
 # ----------------------------
 if __name__ == "__main__":
+    asyncio.run(main()) # 对应你前面定义的 async def main():
     print("🚀 系统启动中...")
     asyncio.run(run())
     # 使用标准入口
