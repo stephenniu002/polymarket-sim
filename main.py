@@ -1,72 +1,91 @@
 import asyncio
 import json
 import websockets
-import os
-import httpx
+import time
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+from strategy import TailStrategy
+from stats import Stats
+from notify import send
 
-BINANCE_WS = "wss://stream.binance.com:9443/ws/ethusdt@trade"
+MARKETS = {
+    "ETH": "wss://stream.binance.com:9443/ws/ethusdt@trade",
+    "BTC": "wss://stream.binance.com:9443/ws/btcusdt@trade"
+}
 
-prices = []
+strategies = {k: TailStrategy() for k in MARKETS}
+stats_map = {k: Stats() for k in MARKETS}
+
+pending_trades = []
 
 BET = 10
-MULTIPLIER = 100
 
-trades = 0
-wins = 0
-balance = 0
-
-async def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": msg
-        })
-
-def check_reversal():
-    if len(prices) < 300:
-        return False
-
-    window = prices[-300:]
-    last_60 = prices[-60:]
-
-    low = min(window)
-    current = prices[-1]
-
-    # 是否接近极限低点
-    distance = (current - low) / low
-
-    # 是否出现反弹
-    rebound = (max(last_60) - low) / low
-
-    if distance < 0.002 and rebound > 0.005:
-        return True
-
-    return False
-
-async def main():
-    global trades, wins, balance
-
-    async with websockets.connect(BINANCE_WS) as ws:
-        print("🟢 已连接 Binance")
-
-        last_report = asyncio.get_event_loop().time()
+async def run_market(name, url):
+    async with websockets.connect(url) as ws:
+        print(f"🟢 {name} 已连接")
 
         while True:
             msg = await ws.recv()
             data = json.loads(msg)
 
             price = float(data["p"])
-            prices.append(price)
+            strategies[name].update(price)
 
-            if len(prices) > 600:
-                prices.pop(0)
+            # 触发信号
+            if strategies[name].signal():
+                pending_trades.append({
+                    "market": name,
+                    "entry": price,
+                    "time": time.time()
+                })
 
-            # 触发策略
-            if check_reversal():
-                trades += 1
+async def settlement_loop():
+    while True:
+        now = time.time()
 
-                # 用真实后60秒判断胜负（关键）
+        for trade in pending_trades[:]:
+            if now - trade["time"] > 60:
+                market = trade["market"]
+                entry = trade["entry"]
+
+                prices = strategies[market].prices[-60:]
+
+                win = max(prices) > entry * 1.003
+
+                stats_map[market].record(win)
+
+                pending_trades.remove(trade)
+
+        await asyncio.sleep(1)
+
+async def report_loop():
+    while True:
+        await asyncio.sleep(300)
+
+        msg = "📊 多市场尾部套利报告\n\n"
+
+        for m, s in stats_map.items():
+            data = s.summary()
+            if not data:
+                continue
+
+            msg += f"【{m}】\n"
+            msg += f"交易: {data['trades']}\n"
+            msg += f"胜率: {data['win_rate']:.2%}\n"
+            msg += f"ROI: {data['roi']:.2f}\n"
+            msg += f"余额: ${data['balance']}\n\n"
+
+        await send(msg)
+        print(msg)
+
+async def main():
+    tasks = []
+
+    for name, url in MARKETS.items():
+        tasks.append(asyncio.create_task(run_market(name, url)))
+
+    tasks.append(asyncio.create_task(settlement_loop()))
+    tasks.append(asyncio.create_task(report_loop()))
+
+    await asyncio.gather(*tasks)
+
+asyncio.run(main())
