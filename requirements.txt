@@ -1,3 +1,4 @@
-httpx
+requests
+aiohttp
 websockets
-requirements.txt
+matplotlib
