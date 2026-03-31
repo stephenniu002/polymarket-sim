@@ -8,8 +8,8 @@ from datetime import datetime
 # ======================
 # 1. 环境变量 (Railway)
 # ======================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY")
+CHAT_ID = os.getenv("5739995837")
 
 # ======================
 # 2. 模拟盘配置
