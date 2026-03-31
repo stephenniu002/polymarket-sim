@@ -9,8 +9,8 @@ from datetime import datetime
 # 🚀 1. 核心配置区 (建议直接在这里填入，最稳！)
 # ==========================================
 # 如果 Railway 环境变量失效，直接把引号内容换成你的真实信息
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or "在这里填入你的机器人Token"
-CHAT_ID = os.getenv("CHAT_ID") or "在这里填入你的数字ID"
+TELEGRAM_TOKEN = os.getenv("8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY") or "在这里填入你的机器人Token"
+CHAT_ID = os.getenv("5739995837") or "在这里填入你的数字ID"
 
 # ==========================================
 # 💰 2. 模拟盘参数设置
