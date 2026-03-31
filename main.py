@@ -15,7 +15,7 @@ CHAT_ID = os.getenv("5739995837")
 # ======================
 # 2. 模拟盘参数设置
 # ======================
-INITIAL_BALANCE = 100000.0  # 初始资金 10万U
+INITIAL_BALANCE = 1000000.0  # 初始资金 100万U
 balance = INITIAL_BALANCE
 BET_AMOUNT = 10.01          # 每单下注 (含滑点模拟)
 WIN_PAYOUT = 1000.0         # 100倍赔率
