@@ -6,127 +6,117 @@ import os
 from datetime import datetime
 
 # ======================
-# 环境变量
+# 1. 环境变量 (Railway 设置)
 # ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # ======================
-# 交易配置
+# 2. 模拟盘配置
 # ======================
-BET_AMOUNT = 10
-INTERVAL = 300  # 5分钟
-INITIAL_BALANCE = 10000.0
-balance = INITIAL_BALANCE
+INITIAL_BALANCE = 100000.0  # 初始 100万U 虚拟金
+BET_AMOUNT = 10.0         # 每次下注 10U (加大筹码看效果)
+INTERVAL = 300             # 5分钟频率
 
-# 统计缓存
+# 模拟统计池
+balance = INITIAL_BALANCE
 total_win = 0
 total_lose = 0
-hour_win = 0
-hour_lose = 0
-hour_profit = 0
+hour_profit = 0.0
 cycle_count = 0
 
-# 监控的市场列表 (Polymarket Token ID 或 标识符)
-# 这里以 BTC 价格预测市场为例，实际生产环境需替换为具体的 Token ID
-MARKETS = ["BTC-Price-High", "ETH-Price-High", "SOL-Price-High"]
+# 模拟市场列表
+MARKETS = ["BTC-75K-YES", "ETH-4K-YES", "SOL-200-YES", "DOGE-0.3-YES"]
 
 # ======================
-# 工具函数
+# 3. 功能函数
 # ======================
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        print(f"TG Error: {e}")
+    except:
+        pass
 
-def get_polymarket_result():
+def get_simulated_outcome():
     """
-    获取真实 Polymarket 数据
-    这里模拟接入 API。实战中你会调用 https://clob.polymarket.com/price
+    核心算法占位：未来这里接入真实 API 价格判断
+    目前模拟：35% 胜率，但获利倍数设为 3倍 (高赔率策略)
     """
-    # 模拟真实市场波动：假设胜率由当前市场盘口决定
-    # 实际上，这里会判断你的预测方向与最终价格的关系
-    # 为了演示，我们保留一个基于概率的判断，但预留 API 接口位置
-    return "win" if random.random() < 0.35 else "lose" # 假设接入策略后胜率提升
+    is_win = random.random() < 0.35
+    return "WIN" if is_win else "LOSE"
 
 # ======================
-# 核心交易循环
+# 4. 交易循环
 # ======================
 async def run_trade_cycle():
-    global balance, total_win, total_lose
-    global hour_win, hour_lose, hour_profit, cycle_count
+    global balance, total_win, total_lose, hour_profit, cycle_count
 
-    # 1. 模拟/获取 真实交易结果
     market = random.choice(MARKETS)
-    result = get_polymarket_result()
-
-    if result == "win":
-        profit = 1000 - BET_AMOUNT # 假设 100 倍赔率或根据实际计算
-        balance += profit
+    result = get_simulated_outcome()
+    
+    # 模拟真实磨损：扣除 0.1% 手续费
+    fee = BET_AMOUNT * 0.001
+    
+    if result == "WIN":
+        # 假设买入的是 0.3 价格的订单，赢了翻 3.3 倍
+        profit = (BET_AMOUNT * 2.3) - fee
         total_win += 1
-        hour_win += 1
     else:
-        profit = -BET_AMOUNT
-        balance += profit
+        profit = -BET_AMOUNT - fee
         total_lose += 1
-        hour_lose += 1
 
+    balance += profit
     hour_profit += profit
     cycle_count += 1
     roi = (balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100
 
-    # 2. 【5分钟报告】
+    # --- 5分钟：单次结果报告 ---
     msg_5m = f"""
-🦞 龙虾 5min 交易报告
+🦞 龙虾虚拟盘 | 5min
 ⏰ {datetime.now().strftime('%H:%M:%S')}
 📊 市场: {market}
-🎯 结果: {result.upper()}
-💰 盈亏: {profit}U
+🎯 结果: {result}
+💰 盈亏: {profit:+.2f}U (含手续费)
 💼 余额: {balance:.2f}U
-📈 总ROI: {roi:.2f}%
+📈 累计ROI: {roi:.2f}%
 """
-    send_telegram(msg_5m)
     print(msg_5m)
+    send_telegram(msg_5m)
 
-    # 3. 【1小时汇总】
+    # --- 1小时：阶段复盘报告 ---
     if cycle_count >= 12:
-        total_trades = hour_win + hour_lose
-        win_rate = (hour_win / total_trades * 100) if total_trades else 0
-        
+        win_rate = (total_win / (total_win + total_lose)) * 100
         msg_1h = f"""
-📊【1小时统计汇总】
+📊【龙虾模拟盘 - 小时结转】
 ━━━━━━━━━━━━━━
-🧾 交易次数: {total_trades}
-✅ 胜: {hour_win} | ❌ 负: {hour_lose}
-🎯 周期胜率: {win_rate:.2f}%
-💰 周期盈亏: {hour_profit}U
-💼 当前总余额: {balance:.2f}U
-🚀 系统状态: 运行中 (Real-time)
+🧾 周期交易: 12 次
+✅ 胜: {total_win} | ❌ 负: {total_lose}
+🎯 总胜率: {win_rate:.2f}%
+💰 本小时盈亏: {hour_profit:+.2f}U
+💼 当前总资产: {balance:.2f}U
 ━━━━━━━━━━━━━━
 """
         send_telegram(msg_1h)
-        # 重置小时统计
-        hour_win, hour_lose, hour_profit, cycle_count = 0, 0, 0, 0
-
-    # 4. 风险控制
-    if balance < 5000:
-        send_telegram("🛑 警告：余额已减半，触发强制止损，系统停机！")
-        os._exit(0)
+        # 重置小时缓存
+        hour_profit = 0.0
+        cycle_count = 0
 
 # ======================
-# 主入口
+# 5. 主程序入口
 # ======================
 async def main():
-    send_telegram("🚀 龙虾 Polymarket 实盘监控启动\n资金: 10000U\n频率: 5min/次 | 1hr/汇总")
+    start_msg = f"🚀 龙虾虚拟盘系统启动\n💰 初始资金: {INITIAL_BALANCE}U\n🛠️ 模式: 策略回测模式"
+    send_telegram(start_msg)
     
     while True:
         start_time = time.time()
+        
         await run_trade_cycle()
-        # 排除代码执行时间，确保精准 5 分钟
-        wait = max(0, INTERVAL - (time.time() - start_time))
-        await asyncio.sleep(wait)
+        
+        # 确保每 5 分钟精准运行
+        elapsed = time.time() - start_time
+        await asyncio.sleep(max(0, INTERVAL - elapsed))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # 使用标准入口
