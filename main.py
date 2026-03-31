@@ -6,123 +6,140 @@ import os
 from datetime import datetime
 
 # ======================
-# 1. 环境变量 (Railway 设置)
+# 1. 环境变量配置
 # ======================
+# 请确保在 Railway 的 Variables 页面配置了这两个 key
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # ======================
-# 2. 模拟盘配置
+# 2. 交易参数配置
 # ======================
-INITIAL_BALANCE = 100000.0  # 初始 100万U 虚拟金
-BET_AMOUNT = 10.0         # 每次下注 10U (加大筹码看效果)
-INTERVAL = 300             # 5分钟频率
-
-# 模拟统计池
+BET_AMOUNT = 10       # 每单下注 10U
+INTERVAL = 300        # 5分钟轮询一次
+INITIAL_BALANCE = 10000.0
 balance = INITIAL_BALANCE
-total_win = 0
-total_lose = 0
-hour_profit = 0.0
-cycle_count = 0
 
-# 模拟市场列表
-MARKETS = ["BTC-75K-YES", "ETH-4K-YES", "SOL-200-YES", "DOGE-0.3-YES"]
+# 监控的市场列表 (7个)
+MARKETS = ["BTC", "ETH", "XRP", "BNB", "DOGE", "SOL", "HYPE"]
+
+# 统计数据
+hour_win = 0
+hour_lose = 0
+hour_profit = 0.0
+cycle_count = 0  # 计数器，到12次(1小时)触发汇报
 
 # ======================
 # 3. 功能函数
 # ======================
 def send_telegram(msg):
+    """发送消息到 Telegram"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print(f"⚠️ 未配置 TG 变量: {msg}")
+        return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except:
-        pass
+        requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+    except Exception as e:
+        print(f"❌ TG 发送失败: {e}")
 
-def get_simulated_outcome():
-    """
-    核心算法占位：未来这里接入真实 API 价格判断
-    目前模拟：35% 胜率，但获利倍数设为 3倍 (高赔率策略)
-    """
-    is_win = random.random() < 0.35
-    return "WIN" if is_win else "LOSE"
+def simulate_trade():
+    """模拟交易结果：3.2% 胜率 (对应 Polymarket 极端反转胜率)"""
+    return "WIN" if random.random() < 0.032 else "LOSE"
 
-# ======================
-# 4. 交易循环
-# ======================
-async def run_trade_cycle():
-    global balance, total_win, total_lose, hour_profit, cycle_count
+def trade_one_market(market):
+    """执行单个市场的模拟逻辑"""
+    global balance, hour_win, hour_lose, hour_profit
 
-    market = random.choice(MARKETS)
-    result = get_simulated_outcome()
-    
-    # 模拟真实磨损：扣除 0.1% 手续费
-    fee = BET_AMOUNT * 0.001
-    
+    result = simulate_trade()
+
     if result == "WIN":
-        # 假设买入的是 0.3 价格的订单，赢了翻 3.3 倍
-        profit = (BET_AMOUNT * 2.3) - fee
-        total_win += 1
+        # 假设赔率 100 倍 (10U 变 1000U)，净利 990U
+        profit = 990.0
+        hour_win += 1
     else:
-        profit = -BET_AMOUNT - fee
-        total_lose += 1
+        # 亏损掉本金 10U
+        profit = -10.0
+        hour_lose += 1
 
     balance += profit
     hour_profit += profit
+
+    return f"{market}: {result} ({'+' if profit > 0 else ''}{profit}U)"
+
+# ======================
+# 4. 核心循环任务
+# ======================
+async def run_trade_cycle():
+    """每 5 分钟跑一次的全币种扫描"""
+    global cycle_count, hour_win, hour_lose, hour_profit
+
+    results_text = []
+    
+    # 7个市场并发模拟
+    for m in MARKETS:
+        res = trade_one_market(m)
+        results_text.append(res)
+
     cycle_count += 1
-    roi = (balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100
+    
+    # --- 5分钟实时简报 ---
+    now_str = datetime.now().strftime('%H:%M:%S')
+    report_5m = f"🦞 *5分钟多市场报告*\n⏰ {now_str}\n\n"
+    report_5m += "\n".join(results_text)
+    report_5m += f"\n\n💰 当前余额: {balance:.2f}U"
+    
+    send_telegram(report_5m)
+    print(f"[{now_str}] 5分钟报表已发送")
 
-    # --- 5分钟：单次结果报告 ---
-    msg_5m = f"""
-🦞 龙虾虚拟盘 | 5min
-⏰ {datetime.now().strftime('%H:%M:%S')}
-📊 市场: {market}
-🎯 结果: {result}
-💰 盈亏: {profit:+.2f}U (含手续费)
-💼 余额: {balance:.2f}U
-📈 累计ROI: {roi:.2f}%
-"""
-    print(msg_5m)
-    send_telegram(msg_5m)
-
-    # --- 1小时：阶段复盘报告 ---
+    # --- 每 1 小时大总结 (12次循环) ---
     if cycle_count >= 12:
-        win_rate = (total_win / (total_win + total_lose)) * 100
-        msg_1h = f"""
-📊【龙虾模拟盘 - 小时结转】
-━━━━━━━━━━━━━━
-🧾 周期交易: 12 次
-✅ 胜: {total_win} | ❌ 负: {total_lose}
-🎯 总胜率: {win_rate:.2f}%
-💰 本小时盈亏: {hour_profit:+.2f}U
-💼 当前总资产: {balance:.2f}U
-━━━━━━━━━━━━━━
-"""
-        send_telegram(msg_1h)
-        # 重置小时缓存
+        total_trades = hour_win + hour_lose
+        win_rate = (hour_win / total_trades * 100) if total_trades else 0
+        
+        report_1h = f"""
+📊 *【1小时战报汇总】*
+------------------------
+🧾 交易总数: {total_trades}
+✅ 胜: {hour_win} | ❌ 负: {hour_lose}
+🎯 实时胜率: {win_rate:.2f}%
+
+💵 本时段盈亏: {hour_profit:+.2f}U
+💼 账户总余额: {balance:.2f}U
+------------------------
+        """
+        send_telegram(report_1h)
+        
+        # 重置小时统计
+        hour_win = 0
+        hour_lose = 0
         hour_profit = 0.0
         cycle_count = 0
 
-# ======================
-# 5. 主程序入口
-# ======================
 async def main():
-    start_msg = f"🚀 龙虾虚拟盘系统启动\n💰 初始资金: {INITIAL_BALANCE}U\n🛠️ 模式: 策略回测模式"
+    """主程序入口"""
+    start_msg = "🚀 *龙虾模拟系统 V2 启动*\n7市场并发扫描中...\n初始资金: 10000U"
+    print(start_msg)
     send_telegram(start_msg)
-    
+
     while True:
         start_time = time.time()
         
+        # 执行一轮交易
         await run_trade_cycle()
         
-        # 确保每 5 分钟精准运行
-        elapsed = time.time() - start_time
-        await asyncio.sleep(max(0, INTERVAL - elapsed))
+        # 精确等待 5 分钟 (扣除执行代码的时间)
+        wait_time = max(0, INTERVAL - (time.time() - start_time))
+        await asyncio.sleep(wait_time)
 
-# ----------------------------
-# 启动入口（必须有）
-# ----------------------------
+# ======================
+# 5. 标准 Python 启动入口
+# ======================
 if __name__ == "__main__":
-    asyncio.run(main()) # 对应你前面定义的 async def main():
-    print("🚀 系统启动中...")
-    asyncio.run(run())
-    # 使用标准入口
+    # 这里的函数名 main() 必须和上面 async def main() 对应
+    asyncio.run(main())
