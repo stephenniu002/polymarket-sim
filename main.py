@@ -118,6 +118,10 @@ async def main():
         elapsed = time.time() - start_time
         await asyncio.sleep(max(0, INTERVAL - elapsed))
 
+# ----------------------------
+# 启动入口（必须有）
+# ----------------------------
 if __name__ == "__main__":
+    print("🚀 系统启动中...")
     asyncio.run(run())
     # 使用标准入口
