@@ -11,8 +11,8 @@ from clob_client.client import ClobClient
 # ==========================================
 # 🔑 1. 核心凭证 (优先从 Railway 环境变量读取)
 # ==========================================
-TG_TOKEN = os.getenv("TG_TOKEN", "8526469896:AAF7oUK3TjEa0Z3KDnwMy7QYqho45MhY")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "57395837")
+TG_TOKEN = os.getenv("TG_TOKEN", "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "5739995837")
 
 POLY_CONFIG = {
     "key": os.getenv("CLOB_API_KEY", "这里填入_API_KEY"),
