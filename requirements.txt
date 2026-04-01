@@ -6,7 +6,6 @@ numpy
 matplotlib
 python-dotenv
 ccxt
-aiohttp
-py-polymarket
-aiohttp
+
+
 
