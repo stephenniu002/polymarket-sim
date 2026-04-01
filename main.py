@@ -14,10 +14,10 @@ CHAT_ID = os.getenv("CHAT_ID") or "5739995837"
 # ==========================================
 # 💰 2. 模拟盘参数 (100万 U)
 # ==========================================
-INITIAL_BALANCE = 1000000.0
+INITIAL_BALANCE = 598.0
 balance = INITIAL_BALANCE
-BET_AMOUNT = 10.01
-WIN_PAYOUT = 1000.0
+BET_AMOUNT = 1.0
+WIN_PAYOUT = 100.0
 MARKETS = ["BTC", "ETH", "XRP", "BNB", "DOGE", "SOL", "HYPE"]
 
 # 统计全局变量
