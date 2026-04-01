@@ -1,181 +1,176 @@
 import asyncio
 import os
 import time
-import ccxt.async_support as ccxt
+import logging
 from datetime import datetime
 import aiohttp
+import ccxt.async_support as ccxt
+from dotenv import load_dotenv
+
+# 加载本地 .env (Railway 部署时会读取其 Variables 界面配置)
+load_dotenv()
 
 # ==========================================
-# 🚀 1. 核心配置区 (实盘敏感信息)
+# 🛡️ 1. 配置与安全区 (从环境变量读取)
 # ==========================================
-TELEGRAM_TOKEN = "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY" 
-CHAT_ID =  "5739995837"
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger("LobsterBot")
 
+TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("TG_CHAT_ID")
+
+# 交易所配置 (支持 Polymarket 的 Clob 或 Binance)
 EXCHANGE_CONFIG = {
-    'apiKey': 'YOUR_API_KEY',
-    'secret': 'YOUR_SECRET_KEY',
+    'apiKey': os.getenv("EXCHANGE_API_KEY"),
+    'secret': os.getenv("EXCHANGE_SECRET"),
+    'password': os.getenv("EXCHANGE_PASS"), # 部分交易所需要
     'enableRateLimit': True,
-    'options': {'defaultType': 'future'}  # 默认使用合约交易
+    'options': {'defaultType': 'future'}
 }
 
-# ==========================================
-# 💰 2. 策略参数
-# ==========================================
-BET_AMOUNT = 1.0          # 每笔下注 1 U
-TARGET_PROFIT_RATIO = 1.3 # 举例：涨 30% 离场 (对应你之前的 WIN_PAYOUT)
-MARKETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
-
-# 统计变量
-balance = 0.0
-initial_balance = 0.0
-consecutive_lose = 0
-MAX_CONSECUTIVE_LOSE = 15 
-is_shadow_mode = False
+# 策略参数
+BET_AMOUNT = 10.0  # 实盘建议 > 10U 避开交易所限制
+MAX_LOSE_STREAK = 15
+MARKETS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 
 # ==========================================
-# 🛠 3. 异步 Telegram 推送
+# 📡 2. 通讯引擎
 # ==========================================
-async def execute_real_trade(self, market_id, side, amount):
-    """实盘下单逻辑"""
-    try:
-        # 1. 检查账户真实余额 (实盘必备)
-        balance = await self.check_poly_balance()
-        if balance < amount:
-            await send_tg_msg("⚠️ 余额不足，取消下单")
-            return False
-
-        # 2. 执行真实下单 (假设使用 clob_client)
-        # order = await self.client.create_order(...)
-        
-        # 3. 确认订单状态 (不要下单后直接判定 WIN/LOSE)
-        # status = await self.confirm_order(order['id'])
-        
-        return True
-    except Exception as e:
-        await send_tg_msg(f"🚨 实盘下单异常: {str(e)}")
-        return False
-
 async def send_tg_msg(msg: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning("TG 配置缺失，仅本地打印日志")
+        return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
     async with aiohttp.ClientSession() as session:
         try:
-            await session.post(url, json=payload, timeout=5)
+            async with session.post(url, json=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    logger.error(f"TG 发送失败: {resp.status}")
         except Exception as e:
-            print(f"TG Error: {e}")
+            logger.error(f"TG 连接异常: {e}")
 
 # ==========================================
-# 📈 4. 核心交易引擎
+# 🦞 3. 实盘机器人核心
 # ==========================================
 class LobsterBot:
     def __init__(self):
         self.exchange = ccxt.binance(EXCHANGE_CONFIG)
         self.is_running = True
+        self.is_shadow_mode = False
+        self.consecutive_lose = 0
+        self.initial_balance = 0.0
 
-    async def get_balance(self):
-        """获取账户可用余额 (USDT)"""
+    async def init_session(self):
+        """初始化：检查 API 有效性并获取初始余额"""
         try:
-            bal = await self.exchange.fetch_balance()
-            return float(bal['total']['USDT'])
+            balance_data = await self.exchange.fetch_balance()
+            self.initial_balance = float(balance_data['total'].get('USDT', 0))
+            logger.info(f"✅ 系统初始化成功 | 初始资金: {self.initial_balance} USDT")
+            await send_tg_msg(f"🚀 *实盘系统已上线 (Railway)*\n初始资金: `{self.initial_balance}` USDT")
+            return True
         except Exception as e:
-            print(f"获取余额失败: {e}")
-            return 0.0
+            logger.error(f"❌ 初始化失败: {e}")
+            return False
 
-    async def execute_logic(self, symbol):
-        """
-        这里定义你的核心入场信号
-        目前示例：简单的随机入场 + 真实下单尝试
-        """
-        global consecutive_lose, is_shadow_mode
+    async def get_current_price(self, symbol):
+        """获取真实市场价格"""
+        ticker = await self.exchange.fetch_ticker(symbol)
+        return ticker['last']
 
-        # 1. 模拟胜率逻辑 (实盘中这里应替换为指标分析，如 RSI, MACD 等)
-        # 这里为了演示保留了随机，但增加了实盘下单动作
-        is_signal = True # 假设永远有信号
-
-        if is_shadow_mode:
-            # 🧪 影子模式：仅观察不操作
-            sim_win = (time.time() % 2 == 0) # 模拟信号回归逻辑
+    async def execute_trade_logic(self, symbol):
+        """核心交易逻辑：实战与影子的分水岭"""
+        # --- 这里替换为你真正的策略判定 (RSI/MACD等) ---
+        # 简单示例：影子模式下模拟判定，实战模式下真实下单
+        
+        if self.is_shadow_mode:
+            # 🧪 影子模式：模拟逻辑 (此处可接入真实行情判断)
+            # 假设影子模式下，我们观察 5 分钟后的价格变动
+            sim_win = (time.time() % 2 == 0) # 暂代
             return "🧪 SHADOW", 0, sim_win
         else:
             # 🟢 实战模式：真实下单
             try:
-                # 示例：市价买入 1U 等额的币
-                # order = await self.exchange.create_market_buy_order(symbol, BET_AMOUNT)
-                # 提示：由于大部分交易所最小下单为 5-10U，BET_AMOUNT 可能需要调整
+                # 真实的下单代码 (取消注释前请确保余额充足)
+                # amount = BET_AMOUNT / await self.get_current_price(symbol)
+                # order = await self.exchange.create_market_buy_order(symbol, amount)
                 
-                # 模拟一个结算结果 (实盘应通过 fetch_my_trades 获取)
+                # 模拟结算逻辑 (实战中需通过 fetch_order 轮询结果)
                 is_win = False 
                 pnl = -BET_AMOUNT
                 
-                if is_win:
-                    consecutive_lose = 0
-                    return "🟢 WIN", pnl, True
+                if not is_win:
+                    self.consecutive_lose += 1
                 else:
-                    consecutive_lose += 1
-                    return "🔴 LOSE", pnl, False
+                    self.consecutive_lose = 0
+                    
+                return "🔴 LOSE" if not is_win else "🟢 WIN", pnl, is_win
             except Exception as e:
-                return f"❌ ERROR: {str(e)[:20]}", 0, False
+                logger.error(f"下单异常: {e}")
+                return "❌ ERROR", 0, False
 
     async def run_cycle(self):
-        global balance, initial_balance, is_shadow_mode, consecutive_lose
-        
-        now = datetime.now().strftime('%H:%M:%S')
+        """单次运行循环"""
+        # 1. 风险对冲检查
+        if not self.is_shadow_mode and self.consecutive_lose >= MAX_LOSE_STREAK:
+            self.is_shadow_mode = True
+            await send_tg_msg(f"🛡️ *避险强制启动*\n连亏 {self.consecutive_lose} 次，切入影子模式。")
+
         results = []
         any_win = False
 
-        # 避险检查
-        if not is_shadow_mode and consecutive_lose >= MAX_CONSECUTIVE_LOSE:
-            is_shadow_mode = True
-            await send_tg_msg(f"🛡️ *避险启动*: 连亏 {consecutive_lose} 次，切入影子模式！")
-
-        for m in MARKETS:
-            status, pnl, win_found = await self.execute_logic(m)
+        # 2. 遍历市场执行
+        for symbol in MARKETS:
+            status, pnl, win_found = await self.execute_trade_logic(symbol)
             if win_found: any_win = True
-            results.append(f"`{m:10}: {status} ({pnl:+.2f}U)`")
+            results.append(f"`{symbol:10}: {status} ({pnl:+.2f}U)`")
 
-        # 信号回归检查
-        if is_shadow_mode and any_win:
-            is_shadow_mode = False
-            consecutive_lose = 0
-            await send_tg_msg("✨ *信号回归*: 影子模式抓到获利，恢复实战！")
+        # 3. 信号回归逻辑
+        if self.is_shadow_mode and any_win:
+            self.is_shadow_mode = False
+            self.consecutive_lose = 0
+            await send_tg_msg("✨ *信号回归*: 影子模式抓到潜在获利，恢复实战！")
 
-        # 更新余额
-        balance = await self.get_balance()
-        roi = ((balance - initial_balance) / initial_balance * 100) if initial_balance else 0
+        # 4. 数据汇总与报告
+        try:
+            bal_data = await self.exchange.fetch_balance()
+            current_bal = float(bal_data['total'].get('USDT', 0))
+            roi = ((current_bal - self.initial_balance) / self.initial_balance * 100) if self.initial_balance else 0
+            
+            report = (f"🦞 *龙虾实战简报*\n"
+                      f"模式: {'🧪 影子' if self.is_shadow_mode else '💰 实战'}\n"
+                      f"----------------------------\n" + 
+                      "\n".join(results) + 
+                      f"\n----------------------------\n"
+                      f"💰 当前余额: *{current_bal:.2f} USDT*\n"
+                      f"📈 累计 ROI: *{roi:.4f}%*")
+            
+            await send_tg_msg(report)
+            logger.info("Cycle completed and report sent.")
+        except Exception as e:
+            logger.error(f"报告生成失败: {e}")
 
-        # 发送简报
-        report = f"🦞 *龙虾实盘系统*\n模式: {'🧪 影子' if is_shadow_mode else '💰 实战'}\n"
-        report += f"⏰ 时间: `{now}`\n----------------------------\n"
-        report += "\n".join(results)
-        report += f"\n----------------------------\n💰 账户余额: *{balance:.2f} USDT*\n📈 实时 ROI: *{roi:.4f}%*"
-        
-        print(report)
-        await send_tg_msg(report)
-
-    async def main(self):
-        print("🚀 系统初始化...")
-        global initial_balance, balance
-        initial_balance = await self.get_balance()
-        balance = initial_balance
-        
-        await send_tg_msg(f"🚀 *实盘系统启动*\n初始资金: {initial_balance} USDT\n市场数: {len(MARKETS)}")
+    async def start(self):
+        if not await self.init_session():
+            return
 
         while self.is_running:
             start_time = time.time()
             await self.run_cycle()
-            # 间隔 5 分钟
-            sleep_time = max(0, 300 - (time.time() - start_time))
-            await asyncio.sleep(sleep_time)
+            # 5 分钟周期，扣除程序执行时间
+            wait_time = max(10, 300 - (time.time() - start_time))
+            await asyncio.sleep(wait_time)
 
 # ==========================================
-# 执行
+# 🏁 4. 入口点
 # ==========================================
 if __name__ == "__main__":
     bot = LobsterBot()
+    loop = asyncio.get_event_loop()
     try:
-        asyncio.run(bot.main())
+        loop.run_until_complete(bot.start())
     except KeyboardInterrupt:
-        print("🛑 程序手动停止")
+        logger.info("用户停止机器人")
     finally:
-        # 异步关闭连接池
-        asyncio.run(bot.exchange.close())
+        loop.run_until_complete(bot.exchange.close())
