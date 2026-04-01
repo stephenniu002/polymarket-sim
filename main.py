@@ -8,8 +8,8 @@ from datetime import datetime
 # ==========================================
 # 🚀 1. 核心配置区
 # ==========================================
-TELEGRAM_TOKEN = "8526808323:AAHmAq3BkNYOxO7MiDzMU3hzXdwU4DIjJlg" 
-CHAT_ID =  "8206453731"
+TELEGRAM_TOKEN = "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY" 
+CHAT_ID =  "5739995837"
 # ==========================================
 # 💰 真实盘
 # ==========================================
