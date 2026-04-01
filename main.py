@@ -10,8 +10,8 @@ from py_polymarket_sdk import ClobClient
 # 🔑 1. 核心凭证 (请务必填入你的真实信息)
 # ==========================================
 # 建议在 Railway Variables 填入，或者直接在这里硬编码替换引号内容
-TG_TOKEN = "3747832418:AAFu_X3_Dsgru-H04X0MRnuZ1efW0pZpbBc"
-TG_CHAT_ID = "8206453731"
+TG_TOKEN = "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY"
+TG_CHAT_ID = "5739995837"
 
 POLY_CONFIG = {
     "key": "这里填入_API_KEY",
