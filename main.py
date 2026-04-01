@@ -1,154 +1,143 @@
+import asyncio
 import random
-import time
 import requests
-import json
-from datetime import datetime, timedelta
+import time
+import os
+from datetime import datetime
 
-# ================= 配置区 =================
-INITIAL_BALANCE = 100000.0
-BET_AMOUNT = 10.01
-WIN_REWARD = 1000.0
-WIN_CHANCE = 0.031
-
-# --- Telegram 配置 ---
-TG_TOKEN = "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY"
-TG_CHAT_ID = "5739995837"
-
-# --- 时间控制 ---
-DELAY = 5                       # 每轮 5 秒
-REPORT_5MIN_INTERVAL = 60       # 60轮 = 5分钟
-REPORT_1HOUR_INTERVAL = 720     # 720轮 = 1小时
-SHADOW_THRESHOLD = 20           # 连亏 20 次触发影子模式
 # ==========================================
+# 🚀 1. 核心配置区
+# ==========================================
+# 优先读取环境变量，读取不到则使用硬编码的备用值
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY"
+CHAT_ID = os.getenv("CHAT_ID") or "5739995837"
 
-class LobsterPro:
-    def __init__(self):
-        self.balance = INITIAL_BALANCE
-        self.start_bal_hour = INITIAL_BALANCE
-        self.consecutive_losses = 0
-        self.is_shadow_mode = False
-        
-        self.markets = ["BTC", "ETH", "XRP", "BNB", "DOGE-YES", "SOL", "HYPE"]
-        
-        # 统计桶
-        self.reset_stats(full=True)
+# ==========================================
+# 💰 2. 模拟盘参数
+# ==========================================
+INITIAL_BALANCE = 1000000.0
+balance = INITIAL_BALANCE
+BET_AMOUNT = 10.01
+WIN_PAYOUT = 1000.0
+MARKETS = ["BTC", "ETH", "XRP", "BNB", "DOGE-0.3-YES", "SOL", "HYPE"]
 
-    def reset_stats(self, full=False):
-        self.five_min_wins = []
-        if full:
-            self.hour_stats = {
-                "total_bets": 0,
-                "wins": 0,
-                "shadow_blocked": 0,
-                "market_win_dist": {m: 0 for m in self.markets}, # 品种胜率分布
-                "start_time": datetime.now()
-            }
+# 统计全局变量
+hour_win = 0
+hour_lose = 0
+hour_profit = 0.0
+cycle_count = 0
+consecutive_lose = 0
+MAX_CONSECUTIVE_LOSE = 20 # 调高一点，因为一轮有7个市场
 
-    def send_tg(self, text):
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        try: requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=5)
-        except: pass
+# ==========================================
+# 🛠 3. Telegram 推送函数
+# ==========================================
+def send_telegram(msg: str):
+    if not TELEGRAM_TOKEN or "在这里" in TELEGRAM_TOKEN or not CHAT_ID:
+        print(f"🛑 [未配置] 无法发送电报。待发内容:\n{msg}")
+        return
 
-    def run_engine(self):
-        round_has_win = False
-        self.hour_stats["total_bets"] += len(self.markets)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"❌ TG 发送异常: {response.text}")
+    except Exception as e:
+        print(f"❌ TG 网络连接失败: {e}")
 
-        for mkt in self.markets:
-            # 核心模拟逻辑：3.1% 胜率
-            is_win = random.random() < WIN_CHANCE
-            
-            if self.is_shadow_mode:
-                if is_win:
-                    self.five_min_wins.append(f"{mkt}(🧪)")
-                    self.hour_stats["wins"] += 1
-                    self.hour_stats["market_win_dist"][mkt] += 1
-                    round_has_win = True
-                else:
-                    self.hour_stats["shadow_blocked"] += 1
-            else:
-                self.balance -= BET_AMOUNT
-                if is_win:
-                    self.balance += WIN_REWARD
-                    self.five_min_wins.append(f"{mkt}(💰)")
-                    self.hour_stats["wins"] += 1
-                    self.hour_stats["market_win_dist"][mkt] += 1
-                    self.consecutive_losses = 0
-                    round_has_win = True
-                else:
-                    self.consecutive_losses += 1
+# ==========================================
+# 📈 4. 核心交易逻辑
+# ==========================================
+async def run_trade_cycle():
+    global balance, hour_win, hour_lose, hour_profit, cycle_count, consecutive_lose
+    now_time = datetime.now().strftime('%H:%M:%S')
+    results_lines = []
+    current_profit = 0.0
 
-        # 避险状态切换
-        if not self.is_shadow_mode and self.consecutive_losses >= SHADOW_THRESHOLD:
-            self.is_shadow_mode = True
-        if self.is_shadow_mode and round_has_win:
-            self.is_shadow_mode = False
-            self.consecutive_losses = 0
+    for market in MARKETS:
+        # 模拟胜率
+        is_win = random.random() < 0.031
 
-    def push_5min_brief(self):
-        """5分钟简报：只看核心结果"""
-        win_str = "、".join(self.five_min_wins) if self.five_min_wins else "暂无"
-        status = "🛡️ 影子避险" if self.is_shadow_mode else "🟢 实战中"
-        
-        msg = (
-            f"⏱ *5min 简报*\n"
-            f"💰 余额: `{self.balance:.2f} U`\n"
-            f"🎯 捕获: {win_str}\n"
-            f"📡 状态: {status}"
-        )
-        self.send_tg(msg)
-        self.five_min_wins = []
+        if is_win:
+            pnl = WIN_PAYOUT - BET_AMOUNT
+            status = "🟢 WIN "
+            hour_win += 1
+            consecutive_lose = 0
+        else:
+            pnl = -BET_AMOUNT
+            status = "🔴 LOSE"
+            hour_lose += 1
+            consecutive_lose += 1
 
-    def push_1hour_report(self):
-        """1小时深度报告：盈亏、胜率、品种分布"""
-        profit = self.balance - self.start_bal_hour
-        roi = ((self.balance - INITIAL_BALANCE) / INITIAL_BALANCE) * 100
-        win_rate = (self.hour_stats["wins"] / (self.hour_stats["total_bets"] or 1)) * 100
-        
-        # 找到本小时表现最好的品种
-        best_mkt = max(self.hour_stats["market_win_dist"], key=self.hour_stats["market_win_dist"].get)
-        best_val = self.hour_stats["market_win_dist"][best_mkt]
+        balance += pnl
+        current_profit += pnl
+        hour_profit += pnl
 
-        msg = (
-            f"📊 *══ 小时结算清单 ══*\n"
-            f"📅 周期: {self.hour_stats['start_time'].strftime('%H:%M')} - {datetime.now().strftime('%H:%M')}\n"
-            f"💰 当前余额: `{self.balance:.2f} U`\n"
-            f"💵 本时段盈亏: `{profit:+.2f} U`\n"
-            f"📈 总计 ROI: `{roi:.4f}%`\n"
-            f"🎯 统计胜率: `{win_rate:.2f}%` (预期3.1%)\n"
-            f"🛡️ 影子避险: `{self.hour_stats['shadow_blocked']} 次` (省下约 {self.hour_stats['shadow_blocked']*BET_AMOUNT:.0f}U)\n"
-            f"🔥 本时段最佳: `{best_mkt}` ({best_val}次WIN)\n"
-            f"━━━━━━━━━━━━━━"
-        )
-        self.send_tg(msg)
-        
-        # 更新参考本金并重置统计
-        self.start_bal_hour = self.balance
-        self.reset_stats(full=True)
+        # 加上反引号保证对齐且不触发 Markdown 错误
+        results_lines.append(f"`{market:12}: {status} ({pnl:+.2f}U)`")
 
-    def main_loop(self):
-        print(f"🦞 龙虾 Pro 启动中...")
-        self.send_tg("🚀 *龙虾 Pro 启动*\n初始本金: 100,000 U\n已开启多市场并发模拟与双级汇报系统。")
-        
-        step = 1
-        while True:
-            try:
-                self.run_engine()
-                
-                # 5分钟汇报
-                if step % REPORT_5MIN_INTERVAL == 0:
-                    self.push_5min_brief()
-                
-                # 1小时汇总
-                if step % REPORT_1HOUR_INTERVAL == 0:
-                    self.push_1hour_report()
-                    step = 0 # 归零防止溢出
-                
-                time.sleep(DELAY)
-                step += 1
-            except Exception as e:
-                print(f"Loop Error: {e}")
-                time.sleep(10)
+    cycle_count += 1
+    roi = ((balance - INITIAL_BALANCE) / INITIAL_BALANCE) * 100
+
+    report = f"🦞 *龙虾虚拟盘 | 5min 多市场报告*\n"
+    report += f"⏰ 时间: `{now_time}`\n"
+    report += "----------------------------\n"
+    report += "\n".join(results_lines)
+    report += "\n\n----------------------------\n"
+    report += f"💰 当前余额: *{balance:.2f}U*\n"
+    report += f"📈 累计 ROI: *{roi:.4f}%*"
+
+    print(report)
+    send_telegram(report)
+
+    # 每小时统计
+    if cycle_count >= 12:
+        total = hour_win + hour_lose
+        win_rate = (hour_win / total * 100) if total else 0
+        summary = f"📊 *【1小时统计大报表】*\n"
+        summary += f"----------------------------\n"
+        summary += f"✅ 胜/负: {hour_win} / {hour_lose}\n"
+        summary += f"🎯 胜率: *{win_rate:.2f}%*\n"
+        summary += f"💵 盈亏: *{hour_profit:+.2f}U*\n"
+        summary += f"💼 余额: *{balance:.2f}U*"
+        send_telegram(summary)
+        hour_win, hour_lose, hour_profit, cycle_count = 0, 0, 0.0, 0
+
+    if consecutive_lose >= MAX_CONSECUTIVE_LOSE:
+        warn_msg = f"⚠️ *风险提示*: 连续亏损已达 {consecutive_lose} 次！"
+        send_telegram(warn_msg)
+        consecutive_lose = 0
+
+# ==========================================
+# 🏁 5. 主程序入口
+# ==========================================
+async def main():
+    # 彻底检查变量是否拿到
+    is_ok = TELEGRAM_TOKEN and len(TELEGRAM_TOKEN) > 20
+    status_icon = "🟢 已连接" if is_ok else "🔴 未配置"
+
+    start_msg = (
+        f"🚀 *龙虾模拟系统启动成功*\n"
+        f"----------------------------\n"
+        f"市场: {len(MARKETS)} 个并发监控\n"
+        f"初始资金: {INITIAL_BALANCE}U\n"
+        f"电报状态: {status_icon}"
+    )
+    print(start_msg)
+    send_telegram(start_msg)
+
+    while True:
+        start_loop_time = time.time()
+        await run_trade_cycle()
+        await asyncio.sleep(max(0, 300 - (time.time() - start_loop_time)))
 
 if __name__ == "__main__":
-    bot = LobsterPro()
-    bot.main_loop()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 程序停止")
