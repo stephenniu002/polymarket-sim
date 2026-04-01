@@ -9,3 +9,4 @@ ccxt
 aiohttp
 py-polymarket
 aiohttp
+python-3.11.0
