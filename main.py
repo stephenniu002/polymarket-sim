@@ -35,6 +35,26 @@ is_shadow_mode = False
 # ==========================================
 # 🛠 3. 异步 Telegram 推送
 # ==========================================
+async def execute_real_trade(self, market_id, side, amount):
+    """实盘下单逻辑"""
+    try:
+        # 1. 检查账户真实余额 (实盘必备)
+        balance = await self.check_poly_balance()
+        if balance < amount:
+            await send_tg_msg("⚠️ 余额不足，取消下单")
+            return False
+
+        # 2. 执行真实下单 (假设使用 clob_client)
+        # order = await self.client.create_order(...)
+        
+        # 3. 确认订单状态 (不要下单后直接判定 WIN/LOSE)
+        # status = await self.confirm_order(order['id'])
+        
+        return True
+    except Exception as e:
+        await send_tg_msg(f"🚨 实盘下单异常: {str(e)}")
+        return False
+
 async def send_tg_msg(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
