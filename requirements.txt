@@ -6,6 +6,7 @@ numpy
 matplotlib
 python-dotenv
 ccxt
-
+py-polymarket-sdk
+web3
 
 
