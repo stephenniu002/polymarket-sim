@@ -1,16 +1,18 @@
 import asyncio
 import os
 import time
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from py_polymarket_sdk import ClobClient
 import aiohttp
+from py_polymarket_sdk import ClobClient
 
+# 1. 基础配置与日志
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger("LobsterPolyReal")
 
-# ==========================================
-# ⚙️ 1. 实战配置 (请在 Railway Variables 填好)
-# ==========================================
+# 2. 环境变量读取 (必须在 Railway Variables 填好)
 POLY_CONFIG = {
     "key": os.getenv("POLY_API_KEY"),
     "secret": os.getenv("POLY_SECRET"),
@@ -19,23 +21,26 @@ POLY_CONFIG = {
     "host": "https://clob.polymarket.com"
 }
 
-# 策略参数
-BET_AMOUNT = 1.0          # 每笔 1U
-SHADOW_THRESHOLD = 3      # 连亏 3 次即切入影子模式 (避险)
-REVERSAL_TIME = 60        # 倒计时 60 秒触发“反转买入”
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-# 7个目标币种 (需手动更新对应的 Condition ID)
+# 3. 策略参数：7个币种监测
+BET_AMOUNT = 1.0        # 每笔 1U
+REVERSAL_WINDOW = 65    # 最后 65 秒进入“反转准备”
+CHECK_INTERVAL = 10     # 每 10 秒扫描一次所有市场
+
+# 目标市场配置 (Condition ID 需要你根据 Polymarket 官网填入)
 MARKETS = {
-    "BTC":  {"id": "0x1...", "base_dir": "涨"},
-    "ETH":  {"id": "0x2...", "base_dir": "涨"},
-    "XRP":  {"id": "0x3...", "base_dir": "涨"},
-    "BNB":  {"id": "0x4...", "base_dir": "跌"},
-    "DOGE": {"id": "0x5...", "base_dir": "涨"},
-    "SOL":  {"id": "0x6...", "base_dir": "涨"},
-    "HYPE": {"id": "0x7...", "base_dir": "涨"}
+    "BTC":  {"id": "0x1...", "original": "涨"},
+    "ETH":  {"id": "0x2...", "original": "涨"},
+    "XRP":  {"id": "0x3...", "original": "涨"},
+    "BNB":  {"id": "0x4...", "original": "跌"},
+    "DOGE": {"id": "0x5...", "original": "涨"},
+    "SOL":  {"id": "0x6...", "original": "涨"},
+    "HYPE": {"id": "0x7...", "original": "涨"}
 }
 
-class LobsterRealBot:
+class LobsterPolyBot:
     def __init__(self):
         self.client = ClobClient(
             POLY_CONFIG["host"], 
@@ -44,70 +49,73 @@ class LobsterRealBot:
             passphrase=POLY_CONFIG["passphrase"], 
             private_key=POLY_CONFIG["private_key"]
         )
-        self.is_shadow = False  # 初始为实战模式
-        self.lose_streak = 0
-        self.history = {}       # 记录本轮是否已下单
+        self.history = set()  # 防止同一周期重复下单
 
-    async def send_tg(self, text):
-        url = f"https://api.telegram.org/bot{os.getenv('TG_TOKEN')}/sendMessage"
-        payload = {"chat_id": os.getenv("TG_CHAT_ID"), "text": text, "parse_mode": "Markdown"}
+    async def send_tg(self, msg):
+        if not TG_TOKEN: return
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         async with aiohttp.ClientSession() as session:
-            await session.post(url, json=payload)
+            try:
+                await session.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+            except: pass
 
-    async def get_market_status(self, market_id):
-        """获取倒计时和当前胜率"""
-        market = self.client.get_market(market_id)
-        # 简化逻辑：返回剩余秒数和当前 Yes 价格
-        return market.get('end_time_remaining'), market.get('cur_price')
-
-    async def execute_trade(self, coin, market_id, direction):
-        """执行下单逻辑"""
-        if self.is_shadow:
-            return f"🧪 [影子观察] 预测 {direction}"
-        
+    async def get_real_balance(self):
+        """获取 Polymarket 账户真实的 USDC 余额"""
         try:
-            # 执行反转买入 (如果是“涨”的反转，就买 NO)
-            outcome = "NO" if direction == "涨" else "YES"
-            # 这里的下单函数需根据 Polymarket SDK 最新文档调用
-            resp = self.client.create_order(
-                market_id=market_id,
-                amount=BET_AMOUNT,
-                outcome=outcome,
-                side="BUY"
-            )
-            return f"💰 [实战下单] {outcome} 成功"
+            resp = self.client.get_balance_allowance(asset_type="collateral")
+            return float(resp.get("balance", 0))
+        except: return 0.0
+
+    async def execute_reversal_trade(self, coin, market_id, original_dir):
+        """执行最后 1 分钟反转逻辑"""
+        try:
+            # 获取市场倒计时
+            market_data = self.client.get_market(market_id)
+            end_time = market_data.get('expiration_timestamp')
+            rem_time = end_time - time.time()
+
+            # 只有在最后 65 秒且未交易过时触发
+            if 0 < rem_time <= REVERSAL_WINDOW and market_id not in self.history:
+                # 反转：原预测“涨”则买“NO”，原预测“跌”则买“YES”
+                outcome = "NO" if original_dir == "涨" else "YES"
+                
+                logger.info(f"🔥 {coin} 触发反转! 剩余 {int(rem_time)}s | 购买: {outcome}")
+                
+                # 执行市价单买入
+                order = self.client.create_order(
+                    market_id=market_id,
+                    amount=BET_AMOUNT,
+                    outcome=outcome,
+                    side="BUY",
+                    order_type="MARKET"
+                )
+                
+                if order.get("success"):
+                    self.history.add(market_id)
+                    await self.send_tg(f"✅ *反转下单成功*\n币种: `{coin}`\n方向: `{outcome}`\n剩余时间: `{int(rem_time)}s`")
+                    return True
         except Exception as e:
-            return f"❌ 失败: {str(e)[:20]}"
+            logger.error(f"{coin} 执行出错: {e}")
+        return False
 
     async def run(self):
-        print("🚀 龙虾实战系统已在 Railway (欧洲节点) 启动")
-        await self.send_tg("🦞 *龙虾实战启动*\n模式: `💰 实战运行` | 初始: `1.0U/笔`")
+        balance = await self.get_real_balance()
+        logger.info(f"✅ 初始化成功 | 实时资金: {balance} USDC")
+        await self.send_tg(f"🚀 *龙虾实盘已激活*\n当前资金: `{balance}` USDC\n监控币种: `7个` | 策略: `最后1分反转`")
 
         while True:
-            results = []
+            # 每 10 秒轮询一次所有币种的倒计时
             for coin, cfg in MARKETS.items():
-                rem_time, price = await self.get_market_status(cfg['id'])
-                
-                # 核心逻辑：最后 1 分钟反转
-                if rem_time and 0 < rem_time <= REVERSAL_TIME:
-                    if cfg['id'] not in self.history:
-                        status = await self.execute_trade(coin, cfg['id'], cfg['base_dir'])
-                        results.append(f"`{coin:5}`: {status}")
-                        self.history[cfg['id']] = True
-                
-                # 模拟盘的“避险”逻辑：如果连亏则切换
-                if self.lose_streak >= SHADOW_THRESHOLD:
-                    self.is_shadow = True
+                await self.execute_reversal_trade(coin, cfg['id'], cfg['original'])
+            
+            # 每小时清理一次历史记录，防止内存堆积，并确保新周期的 Condition ID 能被识别
+            if int(time.time()) % 3600 < 10:
+                self.history.clear()
+                new_bal = await self.get_real_balance()
+                await self.send_tg(f"ℹ️ *小时巡检*\n当前余额: `{new_bal}` USDC")
 
-            if results:
-                report = f"📊 *实时成交简报*\n" + "\n".join(results)
-                await self.send_tg(report)
-            
-            # 清理历史 (每 5 分钟清一次，防止重复下单)
-            if int(time.time()) % 300 < 10: self.history = {}
-            
-            await asyncio.sleep(10) # 高频轮询倒计时
+            await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    bot = LobsterRealBot()
-    asyncio.run(bot.start())
+    bot = LobsterPolyBot()
+    asyncio.run(bot.run())
