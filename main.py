@@ -1,41 +1,42 @@
 import asyncio
+import os
 import time
 import logging
-from datetime import datetime
+import requests
 import aiohttp
 from py_polymarket_sdk import ClobClient
 
 # ==========================================
-# 🔑 1. 核心凭证 (直接在这里填入你的信息)
+# 🔑 1. 核心凭证 (请务必填入你的真实信息)
 # ==========================================
-TG_TOKEN = "8337472418:AAFu_X3_Dsgru-H04X0MRnuZ1efW0pZpbBc"
+# 建议在 Railway Variables 填入，或者直接在这里硬编码替换引号内容
+TG_TOKEN = "3747832418:AAFu_X3_Dsgru-H04X0MRnuZ1efW0pZpbBc"
 TG_CHAT_ID = "8206453731"
 
 POLY_CONFIG = {
-    "key": "这里填入_POLY_API_KEY",
-    "secret": "这里填入_POLY_SECRET",
-    "passphrase": "这里填入_POLY_PASSPHRASE",
-    "private_key": "这里填入_你的钱包私钥_0x...", # 必须包含 0x 前缀
+    "key": "这里填入_API_KEY",
+    "secret": "这里填入_API_SECRET",
+    "passphrase": "这里填入_PASSPHRASE",
+    "private_key": "这里填入_钱包私钥_0x...", 
     "host": "https://clob.polymarket.com"
 }
 
 # ==========================================
-# 🦞 2. 策略参数 (7币监测 + 最后1分反转)
+# 📊 2. 7币监测配置 (Event ID 是链接末尾的数字)
 # ==========================================
+RAW_EVENTS = {
+    "ETH":  {"event_id": "1775053500", "predict": "涨"},
+    "BTC":  {"event_id": "填入你的BTC数字", "predict": "涨"},
+    "XRP":  {"event_id": "填入你的XRP数字", "predict": "涨"},
+    "BNB":  {"event_id": "填入你的BNB数字", "predict": "跌"},
+    "DOGE": {"event_id": "填入你的DOGE数字", "predict": "涨"},
+    "SOL":  {"event_id": "填入你的SOL数字", "predict": "涨"},
+    "HYPE": {"id": "填入你的HYPE数字", "predict": "涨"}
+}
+
 BET_AMOUNT = 1.0        # 每笔 1U
 REVERSAL_WINDOW = 60    # 最后 60 秒触发反转
-CHECK_INTERVAL = 10     # 每 10 秒扫描一次所有市场
-
-# 7个币种监测 (Condition ID 需在 Polymarket 官网 5分钟盘实时获取)
-MARKETS = {
-    "BTC":  {"id": "这里填入_BTC_ID", "predict": "涨"},
-    "ETH":  {"id": "这里填入_ETH_ID", "predict": "涨"},
-    "XRP":  {"id": "这里填入_XRP_ID", "predict": "涨"},
-    "BNB":  {"id": "这里填入_BNB_ID", "predict": "跌"},
-    "DOGE": {"id": "这里填入_DOGE_ID", "predict": "涨"},
-    "SOL":  {"id": "这里填入_SOL_ID", "predict": "涨"},
-    "HYPE": {"id": "这里填入_HYPE_ID", "predict": "涨"}
-}
+CHECK_INTERVAL = 10     # 每 10 秒轮询一次
 
 # ==========================================
 # 🤖 3. 机器人核心引擎
@@ -53,71 +54,80 @@ class LobsterPolyBot:
             private_key=POLY_CONFIG["private_key"]
         )
         self.history = set()
+        self.real_markets = {}
 
     async def send_tg(self, msg):
+        if "这里填入" in TG_TOKEN: return
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         async with aiohttp.ClientSession() as session:
+            try: await session.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+            except: pass
+
+    def sync_condition_ids(self):
+        """自动抓取 Event 对应的 Condition ID"""
+        for coin, cfg in RAW_EVENTS.items():
+            if "填入" in cfg['event_id']: continue
             try:
-                await session.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+                # 访问 Gamma API 获取市场详情
+                url = f"https://gamma-api.polymarket.com/events/{cfg['event_id']}"
+                resp = requests.get(url, timeout=10).json()
+                markets = resp.get("markets", [])
+                if markets:
+                    c_id = markets[0].get("conditionId")
+                    end_time = markets[0].get("endsAt") # ISO格式时间
+                    self.real_markets[coin] = {
+                        "id": c_id, 
+                        "predict": cfg['predict'],
+                        "end_ts": datetime.fromisoformat(end_time.replace('Z', '+00:00')).timestamp()
+                    }
+                    logger.info(f"✅ 已挂载 {coin} | ID: {c_id[:10]}...")
             except Exception as e:
-                logger.error(f"TG 发送失败: {e}")
+                logger.error(f"❌ 抓取 {coin} ID 失败: {e}")
 
     async def get_balance(self):
-        """实时获取 Polymarket 账户 USDC 余额"""
+        """获取真实 USDC 余额"""
         try:
             resp = self.client.get_balance_allowance(asset_type="collateral")
             return float(resp.get("balance", 0))
         except: return 0.0
 
     async def run(self):
-        # 初始化同步
+        self.sync_condition_ids()
         balance = await self.get_balance()
-        logger.info(f"✅ 系统初始化成功 | 初始资金: {balance} USDC")
-        await self.send_tg(f"🚀 *龙虾实盘已激活*\n当前资金: `{balance}` USDC\n模式: `7币反转实操` | 1U/笔")
+        
+        logger.info(f"🚀 系统启动 | 初始资金: {balance} USDC")
+        await self.send_tg(f"🦞 *实盘启动成功*\n当前资金: `{balance}` USDC\n监测币种: `{len(self.real_markets)}个`")
 
         while True:
-            for coin, cfg in MARKETS.items():
-                # 跳过未填 ID 的占位符
-                if "这里填入" in cfg['id']: continue 
-                
-                try:
-                    # 获取该市场详情
-                    m = self.client.get_market(cfg['id'])
-                    # 获取截止时间戳
-                    end_time = m.get('expiration_timestamp') or m.get('end_time')
-                    if not end_time: continue
-                    
-                    rem_time = float(end_time) - time.time()
+            for coin, data in self.real_markets.items():
+                rem_time = data['end_ts'] - time.time()
 
-                    # 核心：最后 60 秒触发反转买入
-                    if 0 < rem_time <= REVERSAL_WINDOW and cfg['id'] not in self.history:
-                        # 【反转逻辑】：原预测“涨”则买“NO”，反之买“YES”
-                        outcome = "NO" if cfg['predict'] == "涨" else "YES"
-                        
-                        logger.info(f"🔥 {coin} 进入反转窗口! 剩余 {int(rem_time)}s")
-                        
-                        # 执行 1U 市价单
+                # 核心：最后 60 秒触发反转
+                if 0 < rem_time <= REVERSAL_WINDOW and data['id'] not in self.history:
+                    # 原预测涨 -> 反转买 NO；原预测跌 -> 反转买 YES
+                    outcome = "NO" if data['predict'] == "涨" else "YES"
+                    
+                    try:
+                        logger.info(f"🔥 {coin} 触发反转! 剩余 {int(rem_time)}s")
                         order = self.client.create_order(
-                            market_id=cfg['id'], 
+                            market_id=data['id'], 
                             amount=BET_AMOUNT, 
                             outcome=outcome, 
                             side="BUY", 
                             order_type="MARKET"
                         )
-                        
                         if order.get("success") or order.get("orderID"):
-                            self.history.add(cfg['id'])
-                            await self.send_tg(f"✅ *反转下单成功*\n币种: `{coin}`\n方向: `{outcome}`\n剩余: `{int(rem_time)}s`")
-                except Exception as e:
-                    logger.debug(f"{coin} 扫描中: {e}")
-            
-            # 每 5 分钟（300秒）重置一次历史记录，针对 5 分钟盘循环
-            if int(time.time()) % 300 < 10:
-                self.history.clear()
-                cur_bal = await self.get_balance()
-                logger.info(f"周期同步 | 当前余额: {cur_bal} USDC")
+                            self.history.add(data['id'])
+                            await self.send_tg(f"✅ *下单成功*\n币种: `{coin}`\n方向: `{outcome}`\n剩余时间: `{int(rem_time)}s`")
+                    except Exception as e:
+                        logger.error(f"下单失败: {e}")
 
-            await asyncio.sleep(CHECK_INTERVAL) # 10 秒轮询一次
+            # 每 5 分钟尝试刷新一次 Condition ID (针对循环开盘的 5min 盘)
+            if int(time.time()) % 300 < 15:
+                self.sync_condition_ids()
+                self.history.clear() # 清理上一轮成交记录
+                
+            await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     bot = LobsterPolyBot()
