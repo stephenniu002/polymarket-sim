@@ -8,13 +8,12 @@ from datetime import datetime
 # ==========================================
 # 🚀 1. 核心配置区
 # ==========================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or "8526469896:AAF7oU1hGK3TjEa0Z3KDnwMy7QYqho45MhY"
-CHAT_ID = os.getenv("CHAT_ID") or "5739995837"
-
+TELEGRAM_TOKEN = "TELEGRAM_TOKEN") 
+CHAT_ID = CHAT_ID"
 # ==========================================
-# 💰 2. 模拟盘参数 (100万 U)
+# 💰 真实盘
 # ==========================================
-INITIAL_BALANCE = 598.0
+INITIAL_BALANCE = 600.0
 balance = INITIAL_BALANCE
 BET_AMOUNT = 1.0
 WIN_PAYOUT = 100.0
