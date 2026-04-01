@@ -23,7 +23,7 @@ MARKETS = ["BTC", "ETH", "XRP", "BNB", "DOGE", "SOL", "HYPE"]
 hour_win, hour_lose, hour_profit = 0, 0, 0.0
 cycle_count = 0
 consecutive_lose = 0
-MAX_CONSECUTIVE_LOSE = 20  # 连亏 20 次触发影子模式
+MAX_CONSECUTIVE_LOSE = 3  # 连亏 3 次触发影子模式
 
 # 🛡️ 避险系统状态
 is_shadow_mode = False
