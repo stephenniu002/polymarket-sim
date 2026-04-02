@@ -1,3 +1,16 @@
+import subprocess
+import sys
+import os
+
+# --- 暴力强制安装核心库 (解决 Railway 缓存问题) ---
+try:
+    from clob_client.client import ClobClient
+except ImportError:
+    print("🚀 正在强制安装缺失的实盘库，请稍候...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "py-clob-client==0.34.6", "aiohttp", "python-dotenv", "eth-account"])
+    from clob_client.client import ClobClient
+    print("✅ 库安装成功，正在初始化机器人...")
+
 import asyncio
 import os
 import json
