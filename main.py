@@ -12,12 +12,15 @@ except ImportError:
     print("✅ 库安装成功，正在初始化机器人...")
 
 import asyncio
-import os
 import json
 import logging
 import time
 import aiohttp
 from datetime import datetime
+from clob_client.clob_types import OrderArgs
+
+# --- 后面的代码保持不变 ---
+# (即我之前发给你的那个带有 5 分钟报告和 7 种货币监控的逻辑)
 
 # 核心实盘库导入
 try:
