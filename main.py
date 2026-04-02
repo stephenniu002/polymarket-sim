@@ -1,15 +1,24 @@
-import subprocess
-import sys
 import os
+import sys
+import subprocess
 
-# --- 暴力强制安装核心库 (解决 Railway 缓存问题) ---
+# --- 强制路径修正逻辑 ---
+# 1. 尝试找到 .venv 路径并加入系统环境
+venv_path = "/app/.venv/lib/python3.11/site-packages"
+if venv_path not in sys.path:
+    sys.path.append(venv_path)
+
+# 2. 暴力重装并指定安装位置
 try:
     from clob_client.client import ClobClient
 except ImportError:
-    print("🚀 正在强制安装缺失的实盘库，请稍候...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "py-clob-client==0.34.6", "aiohttp", "python-dotenv", "eth-account"])
+    print("🚀 正在将库安装到指定路径...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", 
+        "--target", venv_path, 
+        "py-clob-client==0.34.6", "aiohttp", "python-dotenv", "eth-account"
+    ])
     from clob_client.client import ClobClient
-    print("✅ 库安装成功，正在初始化机器人...")
 
 import asyncio
 import json
@@ -19,8 +28,7 @@ import aiohttp
 from datetime import datetime
 from clob_client.clob_types import OrderArgs
 
-# --- 后面的代码保持不变 ---
-# (即我之前发给你的那个带有 5 分钟报告和 7 种货币监控的逻辑)
+# --- 后面保持之前的 7 种货币和报告逻辑 ---
 
 # 核心实盘库导入
 try:
