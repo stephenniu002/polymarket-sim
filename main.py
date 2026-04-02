@@ -1,219 +1,124 @@
 import os
+import sys
 import asyncio
+import logging
 import time
-import json
-import websockets
 from dotenv import load_dotenv
 
-# --- 依赖 ---
+# --- 1. 强制环境与路径补丁 ---
+sys.path.insert(0, os.path.join(os.getcwd(), ".venv", "lib", "python3.11", "site-packages"))
+load_dotenv() # 提前加载
+
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs
-except:
-    import subprocess, sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "py-clob-client"])
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "py-clob-client==0.34.6"])
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs
 
+# --- 2. 日志与变量二次校验 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [V5.6.1] %(message)s')
+logger = logging.getLogger(__name__)
 
-# =========================
-# 初始化
-# =========================
-load_dotenv()
+# 增加多重尝试，防止环境变量名称大小写不一致
+PRIVATE_KEY = os.getenv("PK") or os.getenv("PRIVATE_KEY") or os.getenv("pk") or os.getenv("private_key")
 
-PK = os.getenv("PRIVATE_KEY")
-if not PK:
-    raise ValueError("❌ 请设置 PRIVATE_KEY")
+if not PRIVATE_KEY:
+    # 打印当前环境变量列表（不含具体值，仅看键名），方便你排查 Railway 到底传了啥
+    logger.error(f"❌ 环境变量缺失！当前可用键名: {list(os.environ.keys())}")
+    sys.exit(1) # 优雅退出，防止循环报错
 
-BET_SIZE = float(os.getenv("BET_SIZE", 5))
-
-
-# =========================
-# Binance 实时价格
-# =========================
-class BinanceWS:
+class ApexPredatorV5_6_1:
     def __init__(self):
-        self.price = {}
+        # 初始化客户端
+        self.client = ClobClient("https://clob.polymarket.com", key=PRIVATE_KEY, chain_id=137)
+        self.hunts = {}
+        self.bet_size = float(os.getenv("BET_SIZE", 5.0))
 
-    async def run(self):
-        url = "wss://stream.binance.com:9443/ws/ethusdt@trade"
-
+    async def discovery_loop(self):
+        logger.info("📡 2026 高频引擎：寻找猎物中...")
         while True:
             try:
-                async with websockets.connect(url) as ws:
-                    while True:
-                        msg = json.loads(await ws.recv())
-                        self.price["ETHUSDT"] = float(msg["p"])
-            except:
-                await asyncio.sleep(2)
+                # 尝试抓取多页，确保不被政治盘刷屏
+                all_m = []
+                for cursor in ["MA==", "MTAw"]:
+                    resp = await asyncio.to_thread(self.client.get_markets, next_cursor=cursor)
+                    data = resp.get("data", []) if isinstance(resp, dict) else resp
+                    if data: all_m.extend(data)
+                
+                for m in all_m:
+                    if not isinstance(m, dict) or not m.get('active'): continue
+                    
+                    slug = str(m.get('market_slug', '')).lower()
+                    q = str(m.get('question', '')).lower()
+                    
+                    # 2026 精准匹配逻辑
+                    if "up-or-down" in slug or "price at" in q or "5-min" in q:
+                        mid = m.get('condition_id')
+                        if mid and mid not in self.hunts:
+                            tokens = m.get('tokens')
+                            if tokens and len(tokens) >= 2:
+                                self.hunts[mid] = {
+                                    "q": m.get('question'),
+                                    "tokens": tokens,
+                                    "end": m.get('end_date_iso')
+                                }
+                                logger.info(f"🎯 锁定活跃目标: {m.get('question')}")
 
-    def get(self, symbol="ETHUSDT"):
-        return self.price.get(symbol)
-
-
-# =========================
-# 主系统
-# =========================
-class ApexV7Lite:
-
-    def __init__(self):
-        self.client = ClobClient(
-            "https://clob.polymarket.com",
-            key=PK,
-            chain_id=137
-        )
-
-        self.binance = BinanceWS()
-
-        self.markets = {}
-        self.poly_price = {}
-
-        self.last_trade = 0
-
-    # ---------------------
-    # 市场发现（简化）
-    # ---------------------
-    async def discover(self):
-        while True:
-            try:
-                resp = await asyncio.to_thread(self.client.get_markets)
-                markets = resp.get("data", [])
-
-                for m in markets:
-                    q = (m.get("question") or "").lower()
-
-                    if "ethereum" in q and "price" in q:
-                        mid = m["condition_id"]
-
-                        if mid not in self.markets:
-                            self.markets[mid] = m
-                            print("🎯 发现市场:", m["question"])
+                # 清理过期
+                now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                self.hunts = {k: v for k, v in self.hunts.items() if v['end'] > now_iso}
 
             except Exception as e:
-                print("❌ discover error:", e)
+                logger.error(f"📡 发现异常: {e}")
+            await asyncio.sleep(45)
 
-            await asyncio.sleep(60)
-
-    # ---------------------
-    # Spot Lag（极简）
-    # ---------------------
-    def check_spot_lag(self, mid):
-        spot = self.binance.get()
-        poly = self.poly_price.get(mid)
-
-        if not spot or not poly:
-            return None
-
-        if spot > poly * 1.0015:
-            return "YES"
-
-        if spot < poly * 0.9985:
-            return "NO"
-
-        return None
-
-    # ---------------------
-    # 风控
-    # ---------------------
-    def can_trade(self):
-        return time.time() - self.last_trade > 60
-
-    # ---------------------
-    # 下单
-    # ---------------------
-    async def fire(self, token_id, side):
-        try:
-            ob = await asyncio.to_thread(
-                self.client.get_orderbook,
-                token_id
-            )
-
-            bid = float(ob["bids"][0]["price"])
-            ask = float(ob["asks"][0]["price"])
-
-            if side == "YES":
-                price = min(ask, 0.49)
-            else:
-                price = max(bid, 0.51)
-
-            order = OrderArgs(
-                price=price,
-                size=BET_SIZE,
-                side="buy",
-                token_id=token_id
-            )
-
-            o = await asyncio.to_thread(self.client.create_order, order)
-            signed = self.client.sign_order(o)
-
-            resp = await asyncio.to_thread(
-                self.client.submit_order,
-                signed
-            )
-
-            print("💰 下单成功:", resp)
-
-            self.last_trade = time.time()
-
-        except Exception as e:
-            print("❌ 下单失败:", e)
-
-    # ---------------------
-    # 狙击逻辑
-    # ---------------------
-    async def sniper(self):
+    async def sniper_loop(self):
+        logger.info("⚔️ 狙击手：监测中...")
         while True:
             now = int(time.time())
-            rem = now % 300
-            tte = 300 - rem
-
-            # 最后10秒
-            if tte <= 10:
-
-                for mid, m in self.markets.items():
-
-                    if not self.can_trade():
-                        continue
-
+            rem = now % 300 
+            if 285 <= rem <= 297:
+                for mid, data in list(self.hunts.items()):
                     try:
-                        token = m["tokens"][0]
-                        token_id = token.get("tokenId") or token.get("token_id")
-
-                        ob = await asyncio.to_thread(
-                            self.client.get_orderbook,
-                            token_id
-                        )
-
-                        ask = float(ob["asks"][0]["price"])
-                        self.poly_price[mid] = ask
-
-                        sig = self.check_spot_lag(mid)
-
-                        if sig:
-                            print(f"🚀 信号: {sig}")
-                            await self.fire(token_id, sig)
-
-                    except:
-                        continue
-
+                        t0 = data['tokens'][0]
+                        token_id = t0.get('tokenId') or t0.get('token_id')
+                        ob = await asyncio.to_thread(self.client.get_orderbook, token_id)
+                        
+                        b_vol = sum([float(x['size']) for x in ob.get("bids", [])[:3]])
+                        a_vol = sum([float(x['size']) for x in ob.get("asks", [])[:3]])
+                        
+                        if b_vol > a_vol * 2.5:
+                            logger.info(f"🔥 [YES 触发] {data['q']}")
+                            await self.fire_order(data['tokens'][0], "YES")
+                            await asyncio.sleep(15)
+                        elif a_vol > b_vol * 2.5:
+                            logger.info(f"🔥 [NO 触发] {data['q']}")
+                            await self.fire_order(data['tokens'][1], "NO")
+                            await asyncio.sleep(15)
+                    except: continue
             await asyncio.sleep(0.5)
 
-    # ---------------------
-    # 启动
-    # ---------------------
+    async def fire_order(self, t_data, side):
+        try:
+            t_id = t_data.get('tokenId') or t_data.get('token_id')
+            price = 0.53 if side == "YES" else 0.47
+            order_p = OrderArgs(price=price, size=self.bet_size, side="buy", token_id=t_id)
+            order = await asyncio.to_thread(self.client.create_order, order_p)
+            signed = self.client.sign_order(order)
+            resp = await asyncio.to_thread(self.client.submit_order, signed)
+            logger.info(f"✅ [成交反馈] {resp}")
+        except Exception as e:
+            logger.error(f"❌ [订单拦截] {e}")
+
     async def run(self):
-        print("🚀 Apex V7 Lite 启动")
+        logger.info(f"🚀 V5.6.1 启动 | 自动注入密钥成功")
+        await asyncio.gather(self.discovery_loop(), self.sniper_loop())
 
-        await asyncio.gather(
-            self.binance.run(),
-            self.discover(),
-            self.sniper()
-        )
-
-
-# =========================
-# 启动
-# =========================
 if __name__ == "__main__":
-    bot = ApexV7Lite()
-    asyncio.run(bot.run())
+    try:
+        asyncio.run(ApexPredatorV5_6_1().run())
+    except KeyboardInterrupt:
+        pass
