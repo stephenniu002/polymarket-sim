@@ -60,6 +60,9 @@ class PolymarketBot:
         self.client = self._init_client()
 
     def _init_client(self):
+        if not CONFIG["PK"]:
+            logger.error("❌ 未检测到私钥 PK，请在 Variables 中配置")
+            return None
         try:
             return ClobClient(
                 host=CONFIG["POLY_HOST"],
@@ -75,24 +78,28 @@ class PolymarketBot:
 
     async def send_tg(self, text):
         if not CONFIG["TG_TOKEN"]: return
+        # --- 这里就是之前报错的第 89 行，已修复 ---
         url = f"https://api.telegram.org/bot{CONFIG['TG_TOKEN']}/sendMessage"
         payload = {"chat_id": CONFIG["CHAT_ID"], "text": f"🦞 {text}", "parse_mode": "Markdown"}
         async with aiohttp.ClientSession() as session:
-            try: await session.post(url, json=payload, timeout=10)
-            except: pass
+            try: 
+                await session.post(url, json=payload, timeout=10)
+            except Exception as e: 
+                logger.error(f"TG 发送失败: {e}")
 
     async def execute_trade(self, coin, token_id):
         """自动签名并执行下单"""
         if stats[coin]["consec_loss"] >= MAX_CONSEC_LOSS:
             logger.warning(f"🛑 {coin} 连亏触发停手")
-            return
+            return False
 
         try:
+            # 价格设为 0.99 确保几乎必中成交（市价单逻辑）
             order_args = OrderArgs(price=0.99, size=BET_AMOUNT, side="BUY", token_id=token_id)
             signed_order = self.client.create_order(order_args)
             resp = self.client.post_order(signed_order)
 
-            if resp.get("success"):
+            if resp and resp.get("success"):
                 stats[coin]["trades"] += 1
                 await self.send_tg(f"✅ *下单成功* | {coin}\n订单ID: `{resp.get('orderID')}`")
                 return True
@@ -104,14 +111,21 @@ class PolymarketBot:
 
     async def monitor_market(self, coin, info):
         """多币种并发监测逻辑"""
+        logger.info(f"🔍 开始监控 {coin}...")
         while True:
             try:
                 # 获取市场实时状态 (Gamma API)
                 async with aiohttp.ClientSession() as session:
                     async with session.get(f"https://gamma-api.polymarket.com/events/{info['id']}") as r:
+                        if r.status != 200:
+                            await asyncio.sleep(10)
+                            continue
                         data = await r.json()
                         market = data['markets'][0]
+                        
+                        # 解析结束时间
                         end_ts = datetime.fromisoformat(market['endsAt'].replace('Z', '+00:00')).timestamp()
+                        # 解析 Token IDs (通常是 [Yes_ID, No_ID])
                         token_ids = json.loads(market['clobTokenIds'])
                         
                         # 计算倒计时
@@ -119,13 +133,17 @@ class PolymarketBot:
                         
                         # 信号触发：进入尾部 30 秒且未交易过
                         if 0 < time_left <= SIGNAL_WINDOW and info['id'] not in executed_ids:
+                            # 根据 side 选择 Yes(0) 或 No(1)
                             target_token = token_ids[0] if info['side'] == "涨" else token_ids[1]
+                            logger.info(f"🚀 {coin} 触发信号！执行交易...")
                             success = await self.execute_trade(coin, target_token)
-                            if success: executed_ids.add(info['id'])
+                            if success: 
+                                executed_ids.add(info['id'])
 
             except Exception as e:
                 logger.debug(f"轮询 {coin} 异常: {e}")
-            await asyncio.sleep(10) # 轮询间隔
+            
+            await asyncio.sleep(5) # 提高轮询频率至 5 秒
 
     async def periodic_report(self):
         """定时汇报模块"""
@@ -137,7 +155,10 @@ class PolymarketBot:
             await self.send_tg(msg)
 
     async def start(self):
-        if not self.client: return
+        if not self.client: 
+            logger.error("❌ 机器人无法启动：客户端未初始化")
+            return
+        
         await self.send_tg("🚀 *Polymarket 实盘机器人已上线*\n多币种并行监控中...")
         
         # 并发启动所有币种监听和汇报任务
@@ -147,4 +168,7 @@ class PolymarketBot:
 
 if __name__ == "__main__":
     bot = PolymarketBot()
-    asyncio.run(bot.start())
+    try:
+        asyncio.run(bot.start())
+    except KeyboardInterrupt:
+        logger.info("👋 机器人已手动停止")
