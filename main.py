@@ -3,11 +3,10 @@ import sys
 import asyncio
 import logging
 import time
-import json
 from datetime import datetime
 from dotenv import load_dotenv
 
-# --- 环境补丁 ---
+# --- 1. 环境与路径补丁 ---
 sys.path.insert(0, os.path.join(os.getcwd(), ".venv", "lib", "python3.11", "site-packages"))
 load_dotenv()
 
@@ -20,99 +19,139 @@ except ImportError:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs
 
-# --- 日志配置 ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [LOBSTER-PRO] %(message)s')
+# --- 2. 日志配置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [LOBSTER-V5.8] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ================= 配置区 =================
-BET_SIZE = float(os.getenv("BET_SIZE", 5.0))  # 每单金额
-SHADOW_THRESHOLD = 5                         # 连亏 5 次开启影子模式（实盘建议设小点）
-OFI_THRESHOLD = 2.5                          # 订单流压制倍数信号
-# ==========================================
+# --- 3. 配置常量 ---
+PK = os.getenv("PK") or os.getenv("PRIVATE_KEY")
+BET_SIZE = float(os.getenv("BET_SIZE", 2.0))      # 建议初次 7 币同做设小点
+SHADOW_LIMIT = 5                                  # 连亏 5 次开启影子模式
+OFI_THRESHOLD = 2.2                               # 订单流压制倍数
+STALL_THRESHOLD = 0.003                           # 价格停滞阈值 (0.3美分)
+TARGET_COINS = ["btc", "eth", "sol", "xrp", "doge", "bnb", "hype"] # 7大目标
 
-class LobsterReal:
+class LobsterLegion:
     def __init__(self):
-        pk = os.getenv("PK") or os.getenv("PRIVATE_KEY")
-        if not pk: raise ValueError("❌ 缺失私钥")
-        
-        self.client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
-        self.hunts = {}
-        self.consecutive_losses = 0
-        self.is_shadow_mode = False
-        self.history_file = "real_trade_log.json"
+        if not PK: raise ValueError("❌ 缺失私钥 PK")
+        self.client = ClobClient("https://clob.polymarket.com", key=PK, chain_id=137)
+        self.hunts = {}          # 活跃市场池
+        self.last_prices = {}    # 价格缓存，用于判断停滞
+        self.loss_count = 0      # 连亏计数
+        self.is_shadow = False   # 影子模式开关
 
-    async def get_active_markets(self):
-        """获取活跃的 5min 市场"""
-        try:
-            resp = await asyncio.to_thread(self.client.get_markets)
-            markets = resp.get("data", []) if isinstance(resp, dict) else resp
-            for m in markets:
-                if not isinstance(m, dict) or not m.get('active'): continue
-                q = m.get('question', '').lower()
-                if "price at" in q or "5-minute" in q:
-                    mid = m.get('condition_id')
-                    if mid not in self.hunts:
-                        self.hunts[mid] = {
-                            "q": m.get('question'),
-                            "tokens": m.get('tokens'),
-                            "end": m.get('end_date_iso')
-                        }
-            # 清理过期
-            now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-            self.hunts = {k: v for k, v in self.hunts.items() if v['end'] > now_iso}
-        except Exception as e:
-            logger.error(f"📡 扫描异常: {e}")
+    def is_stalling(self, mid, current_price):
+        """核心：判断价格是否在高位/低位涨不动了"""
+        last = self.last_prices.get(mid)
+        self.last_prices[mid] = current_price
+        if last is None: return False
+        return abs(current_price - last) < STALL_THRESHOLD
 
-    async def sniper_logic(self):
-        """核心狙击逻辑"""
-        now = int(time.time())
-        rem = now % 300
-        
-        # 仅在周期最后 15 秒观察
-        if 285 <= rem <= 298:
-            # 影子模式检查
-            if not self.is_shadow_mode and self.consecutive_losses >= SHADOW_THRESHOLD:
-                self.is_shadow_mode = True
-                logger.warning(f"🚨 [风控] 连亏 {self.consecutive_losses} 次，进入影子模式（只观察不买）")
-
-            for mid, data in list(self.hunts.items()):
-                try:
-                    t0 = data['tokens'][0]
-                    tid = t0.get('tokenId') or t0.get('token_id')
-                    ob = await asyncio.to_thread(self.client.get_orderbook, tid)
+    async def discovery_loop(self):
+        """扫描全场，自动锁定 7 个币的 5min 盘口"""
+        logger.info(f"📡 军团扫描启动：目标币种 {TARGET_COINS}")
+        while True:
+            try:
+                # 扫描前两页，确保覆盖所有币种
+                all_data = []
+                for cursor in ["MA==", "MTAw"]:
+                    resp = await asyncio.to_thread(self.client.get_markets, next_cursor=cursor)
+                    all_data.extend(resp.get("data", []) if isinstance(resp, dict) else resp)
+                
+                for m in all_data:
+                    if not m.get('active'): continue
+                    q = str(m.get('question', '')).lower()
                     
-                    b_vol = sum([float(x['size']) for x in ob.get("bids", [])[:3]])
-                    a_vol = sum([float(x['size']) for x in ob.get("asks", [])[:3]])
+                    # 匹配逻辑：标题包含目标币种 + 包含 price/above/5-min
+                    is_target = any(coin in q for coin in TARGET_COINS)
+                    is_5min = any(k in q for k in ["price at", "above", "5-minute", "up-or-down"])
+                    
+                    if is_target and is_5min:
+                        mid = m.get('condition_id')
+                        if mid not in self.hunts:
+                            self.hunts[mid] = {
+                                "q": m.get('question'),
+                                "tokens": m.get('tokens'),
+                                "end": m.get('end_date_iso', '2099-12-31')
+                            }
+                            logger.info(f"🎯 军团锁定目标: {m.get('question')[:40]}...")
 
-                    # 判定信号
-                    side = None
-                    if b_vol > a_vol * OFI_THRESHOLD: side = "YES"
-                    elif a_vol > b_vol * OFI_THRESHOLD: side = "NO"
+                # 清理过期目标
+                now_iso = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                self.hunts = {k: v for k, v in self.hunts.items() if v['end'] > now_iso}
+                logger.info(f"📊 当前监听池: {len(self.hunts)} 个市场")
 
-                    if side:
-                        if self.is_shadow_mode:
-                            logger.info(f"🧪 [影子模拟] 发现 {side} 信号，但不下单: {data['q'][:20]}")
-                            # 影子模式下，假设这一单会赢，从而重置进入实盘（你可以根据需要修改这个逻辑）
-                            # 真实的逻辑应该是：等待 5 分钟看这单到底赢没赢。为了简化，我们模拟捕获一次信号就恢复。
-                            self.is_shadow_mode = False
-                            self.consecutive_losses = 0
-                        else:
-                            await self.execute_trade(data, side)
-                            await asyncio.sleep(10) # 防止同个市场重复下单
-                except:
-                    continue
+            except Exception as e:
+                logger.error(f"📡 扫描异常: {e}")
+            await asyncio.sleep(45)
 
-    async def execute_trade(self, market_data, side):
-        """执行真实下单"""
+    async def sniper_loop(self):
+        """反转狙击逻辑：检测过热 -> 等待 -> 确认停滞 -> 反向开火"""
+        logger.info("⚔️ 狙击手就位：等待 5min 周期末尾信号...")
+        while True:
+            now = int(time.time())
+            rem = now % 300 
+            
+            # 锁定每个周期的最后 25 秒（2:49:35 - 2:49:58）
+            if 275 <= rem <= 298:
+                # 风控自检
+                if not self.is_shadow and self.loss_count >= SHADOW_LIMIT:
+                    self.is_shadow = True
+                    logger.warning(f"🚨 [风控] 连亏达标，已切换至影子模式！")
+
+                for mid, data in list(self.hunts.items()):
+                    try:
+                        # 1. 获取盘口 (Orderbook)
+                        t_yes = data['tokens'][0]
+                        tid = t_yes.get('tokenId') or t_yes.get('token_id')
+                        ob = await asyncio.to_thread(self.client.get_orderbook, tid)
+                        
+                        bids, asks = ob.get("bids", []), ob.get("asks", [])
+                        if not bids or not asks: continue
+                        
+                        b_vol = sum([float(x['size']) for x in bids[:3]])
+                        a_vol = sum([float(x['size']) for x in asks[:3]])
+                        mid_p = (float(bids[0]['price']) + float(asks[0]['price'])) / 2
+
+                        # 2. 逻辑判定：买盘极强 (YES 追多) -> 反向买 NO
+                        if b_vol > a_vol * OFI_THRESHOLD:
+                            logger.info(f"⚠️ {data['q'][:15]} 多头过热，等待反转信号...")
+                            await asyncio.sleep(3) # 关键：等待 3 秒
+                            
+                            if self.is_stalling(mid, mid_p):
+                                logger.info(f"🔥 [反转确认] 买入 NO | {data['q'][:20]}")
+                                await self.execute_trade(data['tokens'][1], "NO")
+                                await asyncio.sleep(10) # 冷却防止同币重发
+
+                        # 3. 逻辑判定：卖盘极强 (NO 砸盘) -> 反向买 YES
+                        elif a_vol > b_vol * OFI_THRESHOLD:
+                            logger.info(f"⚠️ {data['q'][:15]} 空头过热，等待反转信号...")
+                            await asyncio.sleep(3)
+                            
+                            if self.is_stalling(mid, mid_p):
+                                logger.info(f"🔥 [反转确认] 买入 YES | {data['q'][:20]}")
+                                await self.execute_trade(data['tokens'][0], "YES")
+                                await asyncio.sleep(10)
+                                
+                    except Exception as e:
+                        continue
+                await asyncio.sleep(1) # 循环内微调
+            else:
+                await asyncio.sleep(1) # 非末尾期低频轮询
+
+    async def execute_trade(self, t_data, side):
+        """执行下单：区分影子与实盘"""
+        if self.is_shadow:
+            logger.info(f"🧪 [影子模拟] {side} 信号达成，观察但不下单。")
+            # 影子模式下模拟一次成功，尝试重置连亏
+            self.loss_count = 0
+            self.is_shadow = False
+            return
+
         try:
-            token_idx = 0 if side == "YES" else 1
-            t_data = market_data['tokens'][token_idx]
             t_id = t_data.get('tokenId') or t_data.get('token_id')
-            
-            # 价格略微进场
+            # 价格微进场：0.52/0.48 确保反转时能成交
             price = 0.52 if side == "YES" else 0.48
-            
-            logger.info(f"💰 [实盘出击] 方向: {side} | 标的: {market_data['q'][:30]}")
             
             order_p = OrderArgs(price=price, size=BET_SIZE, side="buy", token_id=t_id)
             order = await asyncio.to_thread(self.client.create_order, order_p)
@@ -120,20 +159,22 @@ class LobsterReal:
             resp = await asyncio.to_thread(self.client.submit_order, signed)
             
             if resp.get("success"):
-                logger.info(f"✅ 下单成功: {resp.get('order_id')}")
+                logger.info(f"✅ [实盘成交] {side} | ID: {resp.get('order_id')}")
+                self.loss_count = 0
             else:
-                logger.error(f"❌ 下单拒绝: {resp}")
-                self.consecutive_losses += 1 # 如果下单失败或亏损，增加计数
+                logger.error(f"❌ [下单失败] {resp}")
+                self.loss_count += 1
         except Exception as e:
-            logger.error(f"❌ 执行异常: {e}")
+            logger.error(f"❌ [执行异常] {e}")
+            self.loss_count += 1
 
-    async def main_loop(self):
-        logger.info(f"🦞 Lobster Pro 启动 | 模式: {'影子' if self.is_shadow_mode else '实盘'}")
-        while True:
-            await self.get_active_markets()
-            await self.sniper_logic()
-            await asyncio.sleep(1)
+    async def run(self):
+        logger.info(f"🚀 Lobster Legion V5.8 启动！")
+        logger.info(f"💰 初始单笔额度: {BET_SIZE} USDC | 目标池: {TARGET_COINS}")
+        await asyncio.gather(self.discovery_loop(), self.sniper_loop())
 
 if __name__ == "__main__":
-    bot = LobsterReal()
-    asyncio.run(bot.main_loop())
+    try:
+        asyncio.run(LobsterLegion().run())
+    except KeyboardInterrupt:
+        pass
