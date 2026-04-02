@@ -122,4 +122,62 @@ class PolymarketBot:
                             time_left = end_ts - time.time()
 
                             # 1. 还没到 5 分钟：慢速轮询
-                            if time_left > SIGNAL_WINDOW
+                            if time_left > SIGNAL_WINDOW:
+                                wait_time = 20
+                            
+                            # 2. 进入 5 分钟尾盘：高频监控 (5秒/次)
+                            elif 60 < time_left <= SIGNAL_WINDOW:
+                                logger.info(f"👀 {coin} 距离结束 {int(time_left)}s")
+                                wait_time = 5
+                            
+                            # 3. 进入 1 分钟窗口：直接下单
+                            elif 0 < time_left <= EXECUTE_WINDOW and info['id'] not in executed_ids:
+                                logger.info(f"⚡ {coin} 触发1分钟下单限制！")
+                                token_ids = json.loads(market['clobTokenIds'])
+                                target_token = token_ids[0] if info['side'] == "涨" else token_ids[1]
+                                if await self.execute_trade(coin, target_token):
+                                    executed_ids.add(info['id'])
+                                wait_time = 10
+                            else:
+                                wait_time = 60
+
+            except:
+                wait_time = 15
+            await asyncio.sleep(wait_time)
+
+    async def periodic_report(self):
+        """每 5 分钟进行一次资产和交易汇报"""
+        while True:
+            await asyncio.sleep(REPORT_INTERVAL)
+            balance = await self.get_balance_safe()
+            
+            msg = "📊 *【5分钟实盘报告】*\n"
+            msg += f"💰 *钱包余额*: `{balance}`\n"
+            msg += "────────────────\n"
+            
+            has_action = False
+            for coin, data in stats.items():
+                if data['trades'] > 0:
+                    msg += f"• {coin}: 本次成交 {data['success']} 次\n"
+                    has_action = True
+            
+            if not has_action:
+                msg += "_当前周期无下单成交_\n_所有监控点运行正常..._"
+            
+            await self.send_tg(msg)
+
+    async def start(self):
+        if not self.client: 
+            logger.error("❌ 无法启动: 客户端未初始化")
+            return
+        
+        await self.send_tg("🚀 *Polymarket 尾盘机器人已上线*\n- 策略：5分钟尾盘/1分钟抢单\n- 状态：7种货币并行监控中")
+        
+        # 并行执行监控和报告
+        tasks = [self.monitor_market(c, i) for c, i in COINS.items()]
+        tasks.append(self.periodic_report())
+        await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    bot = PolymarketBot()
+    asyncio.run(bot.start())
