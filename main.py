@@ -3,10 +3,9 @@ import sys
 import asyncio
 import logging
 import time
-import re
 from dotenv import load_dotenv
 
-# --- 1. 环境路径补丁 ---
+# --- 1. 强制环境补丁 ---
 sys.path.insert(0, os.path.join(os.getcwd(), ".venv", "lib", "python3.11", "site-packages"))
 
 try:
@@ -18,119 +17,124 @@ except ImportError:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import OrderArgs
 
-# --- 2. 配置 ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [V5.2.3] %(message)s')
+# --- 2. 日志与配置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [V5.4] %(message)s')
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-class ApexPredator:
+class ApexPredatorV5_4:
     def __init__(self):
         pk = os.getenv("PK") or os.getenv("PRIVATE_KEY")
-        if not pk: raise ValueError("❌ 缺失 PK")
+        if not pk: raise ValueError("❌ 环境变量中缺少 PK")
         self.client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
         self.hunts = {}
         self.bet_size = float(os.getenv("BET_SIZE", 5.0))
-        # 匹配 "BTC Price at 1:00 PM" 这种典型的 5min 市场格式
-        self.pattern = re.compile(r"(btc|eth|sol)\s+price\s+at\s+\d{1,2}:\d{2}", re.IGNORECASE)
 
     async def discovery_loop(self):
-        logger.info("📡 发现引擎：基于前端特征的精准扫描开启...")
+        """核心改进：放宽匹配条件，只要包含币种和价格特征就抓取"""
+        logger.info("📡 发现引擎：深度模糊扫描启动...")
         while True:
             try:
-                # 获取全场市场
+                # 显式使用异步线程处理同步请求
                 resp = await asyncio.to_thread(self.client.get_markets)
                 markets = resp.get("data", []) if isinstance(resp, dict) else resp
                 
-                found_this_round = 0
+                # 扩大关键词库：Polymarket 5min 市场最新的特征词
+                # 只要满足 (币种) + (Price) + (at) 的组合就锁定
+                found_count = 0
                 for m in markets:
                     if not isinstance(m, dict): continue
                     
-                    q_text = str(m.get('question', ''))
-                    desc_text = str(m.get('description', ''))
-                    full_text = (q_text + " " + desc_text).lower()
-
-                    # 核心改动：正则匹配 5min 市场的标题特征
-                    if self.pattern.search(full_text) or "fiveminute" in full_text:
+                    q = str(m.get('question', '')).lower()
+                    desc = str(m.get('description', '')).lower()
+                    full = q + " " + desc
+                    
+                    # 匹配逻辑：BTC/ETH/SOL 且 包含 "price" 且 包含 "at"
+                    is_crypto_price = any(coin in full for coin in ["btc", "eth", "sol"])
+                    is_time_sensitive = "price" in full and "at" in full
+                    
+                    if is_crypto_price and is_time_sensitive:
                         mid = m.get('condition_id')
                         if mid and mid not in self.hunts:
                             tokens = m.get('tokens')
+                            # 确保有两个 Token (Yes/No) 且数据完整
                             if tokens and len(tokens) >= 2:
                                 self.hunts[mid] = {
-                                    "q": q_text,
+                                    "q": m.get('question'),
                                     "tokens": tokens,
-                                    "end": m.get('end_date_iso') # 记录结束时间
+                                    "end": m.get('end_date_iso', '9999-12-31')
                                 }
-                                found_this_round += 1
-                                logger.info(f"🎯 发现精准目标: {q_text}")
+                                found_count += 1
+                                logger.info(f"🎯 锁定猎物: {m.get('question')}")
 
-                if found_this_round == 0 and not self.hunts:
-                    logger.info(f"🔎 扫描了 {len(markets)} 个市场，正在等待新盘口生成...")
+                # 打印当前库存，方便排查
+                if found_count == 0 and not self.hunts:
+                    logger.info(f"🔎 扫描了 {len(markets)} 个市场，当前库存为 0，等待新盘口...")
                 
-                # 自动剔除已结束的市场
+                # 清理逻辑：移除已过期的市场
                 now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                self.hunts = {k: v for k, v in self.hunts.items() if v.get('end', '9999') > now_iso}
+                self.hunts = {k: v for k, v in self.hunts.items() if v['end'] > now_iso}
 
             except Exception as e:
                 logger.error(f"📡 扫描异常: {e}")
-            await asyncio.sleep(45) # 加快扫描频率
+            await asyncio.sleep(45)
 
     async def sniper_loop(self):
-        logger.info("⚔️ 狙击手：监测窗口已开启...")
+        """核心改进：不仅看盘口，更要抢时间"""
+        logger.info("⚔️ 狙击手：窗口期轮询就绪...")
         while True:
             now = int(time.time())
-            # 5分钟周期的秒数余数
-            rem = now % 300
-            
-            # 我们在 280-295 秒（最后 5-20 秒）进行全力分析
-            if 280 <= rem <= 297:
+            rem = now % 300  # 5分钟周期
+
+            # 锁定收盘前 5-18 秒
+            if 282 <= rem <= 295:
                 for mid, data in list(self.hunts.items()):
                     try:
-                        # 兼容 tokenId 的不同写法
+                        # 兼容不同 API 版本的 Key 名
                         t0 = data['tokens'][0]
-                        y_id = t0.get('tokenId') or t0.get('token_id')
+                        token_id = t0.get('tokenId') or t0.get('token_id')
                         
-                        # 非阻塞获取盘口
-                        ob = await asyncio.to_thread(self.client.get_orderbook, y_id)
+                        ob = await asyncio.to_thread(self.client.get_orderbook, token_id)
                         
-                        bids, asks = ob.get("bids", [])[:3], ob.get("asks", [])[:3]
+                        bids = ob.get("bids", [])[:3]
+                        asks = ob.get("asks", [])[:3]
+                        
                         b_vol = sum([float(x['size']) for x in bids]) if bids else 0
                         a_vol = sum([float(x['size']) for x in asks]) if asks else 0
                         
-                        # V5.2.3 信号门槛：3倍压制
-                        if b_vol > a_vol * 3.0:
-                            await self.fire_order(data['tokens'][0], "YES", data['q'])
-                            await asyncio.sleep(20) # 单个市场单次成交后进入冷却
-                        elif a_vol > b_vol * 3.0:
-                            await self.fire_order(data['tokens'][1], "NO", data['q'])
-                            await asyncio.sleep(20)
-                            
+                        # V5.4 动态信号：放低门槛至 2.2 倍，增加开仓率
+                        if b_vol > a_vol * 2.2:
+                            logger.info(f"🔥 [YES 信号确认] 标的: {data['q'][:20]}")
+                            await self.fire_order(data['tokens'][0], "YES")
+                            await asyncio.sleep(15)
+                        elif a_vol > b_vol * 2.2:
+                            logger.info(f"🔥 [NO 信号确认] 标的: {data['q'][:20]}")
+                            await self.fire_order(data['tokens'][1], "NO")
+                            await asyncio.sleep(15)
                     except:
                         continue
-            await asyncio.sleep(0.5) # 极速轮询
+            await asyncio.sleep(0.5)
 
-    async def fire_order(self, t_data, side, q_name):
+    async def fire_order(self, t_data, side):
         try:
             t_id = t_data.get('tokenId') or t_data.get('token_id')
-            # 抢单价：YES 给 0.52 确保成交，NO 给 0.48 确保成交
+            # 暴力抢成交价格
             price = 0.52 if side == "YES" else 0.48
-            
-            logger.info(f"🔥 [出击] 方向: {side} | 标的: {q_name[:30]}")
             
             order_p = OrderArgs(price=price, size=self.bet_size, side="buy", token_id=t_id)
             order = await asyncio.to_thread(self.client.create_order, order_p)
             signed = self.client.sign_order(order)
             resp = await asyncio.to_thread(self.client.submit_order, signed)
-            
-            logger.info(f"💰 [成交] 订单反馈: {resp}")
+            logger.info(f"💰 [下单反馈] {resp}")
         except Exception as e:
-            logger.error(f"❌ [失败] 原因: {e}")
+            logger.error(f"❌ [执行失败] {e}")
 
     async def run(self):
-        logger.info(f"🚀 V5.2.3 APEX 启动 | 注资: {self.bet_size} USDC")
+        logger.info(f"🚀 V5.4 APEX Predator 正在就位 | 规模: {self.bet_size} USDC")
         await asyncio.gather(self.discovery_loop(), self.sniper_loop())
 
 if __name__ == "__main__":
     try:
-        asyncio.run(ApexPredator().run())
+        asyncio.run(ApexPredatorV5_4().run())
     except KeyboardInterrupt:
         pass
