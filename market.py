@@ -1,33 +1,42 @@
-import os
-import logging
 import requests
 
-# 日志设置
-logger = logging.getLogger("LOBSTER-TRADER")
+BASE = "https://clob.polymarket.com"
+# 扩展了关键词，确保 5min 盘口能被搜到
+TARGETS = ["Bitcoin", "Ethereum", "Solana", "XRP", "BNB", "Dogecoin", "BTC", "ETH", "SOL"]
 
-# 🔐 自动读取你 Railway 里的环境变量
-API_KEY = os.getenv("POLY_API_KEY")
-SECRET = os.getenv("POLY_SECRET")
-PASSPHRASE = os.getenv("POLY_PASSPHRASE")
-PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY") or os.getenv("PK")
+def get_markets():
+    try:
+        return requests.get(f"{BASE}/markets", timeout=10).json()
+    except:
+        return []
 
-def get_balance():
-    """
-    提供给 main.py 调用的余额查询函数
-    """
-    # 暂时返回 100 确保逻辑跑通，后续可接入 API
-    return 100.0 
+def load_tokens():
+    """方案 A 核心函数：提取所有目标 Token ID"""
+    markets = get_markets()
+    result = []
 
-def place_order(token_id, price, size, side="BUY"):
-    """
-    【核心函数】提供给 main.py 调用的下单接口
-    """
-    if not API_KEY or not PRIVATE_KEY:
-        logger.error("❌ 下单失败：环境变量缺失 API_KEY 或 PRIVATE_KEY")
-        return None
+    for m in markets:
+        if "tokens" not in m or "question" not in m:
+            continue
 
-    # 在 Railway 日志中打印，方便观察是否触发
-    logger.info(f"🚀 [实盘指令] {side} | 价格: {price} | 数量: {size} | Token: {token_id[:8]}")
-    
-    # 返回模拟成功响应，确保 main.py 继续运行
-    return {"orderID": "REAL_SUCCESS", "status": "OK"}
+        q_text = m["question"].lower()
+        # 匹配币种关键词
+        if any(t.lower() in q_text for t in TARGETS):
+            yes_token = None
+            for token in m.get("tokens", []):
+                # 寻找 YES / UP 端的 Token ID
+                outcome = token.get("outcome", "").lower()
+                if outcome in ["yes", "up", "above"]:
+                    yes_token = token.get("token_id")
+            
+            if yes_token:
+                result.append({
+                    "name": m["question"],
+                    "token": yes_token
+                })
+    return result
+
+def top_markets():
+    """兼容层：返回纯 ID 列表供 main.py 快速过滤"""
+    tokens_data = load_tokens()
+    return [item["token"] for item in tokens_data]
