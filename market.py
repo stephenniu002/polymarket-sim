@@ -3,22 +3,24 @@ import requests
 BASE = "https://clob.polymarket.com"
 TARGETS = ["Bitcoin", "Ethereum", "Solana", "XRP", "BNB", "Dogecoin", "BTC", "ETH", "SOL"]
 
-# 修改 1: 将 get_markets 改为 get_market (或者保留两者)
-def get_market(): 
+def get_market(keyword=None):
+    """获取市场列表，支持按关键词过滤"""
     try:
-        # 注意：CLOB API 的 /markets 接口返回数据量很大，建议确认接口路径正确
-        response = requests.get(f"{BASE}/markets", timeout=10)
-        return response.json()
+        # 获取所有活跃市场
+        resp = requests.get(f"{BASE}/markets", timeout=10)
+        markets = resp.json()
+        if keyword:
+            # 如果 main.py 传了 "Trump"，这里进行过滤
+            return [m for m in markets if keyword.lower() in str(m.get("question", "")).lower()]
+        return markets
     except Exception as e:
-        print(f"Error fetching markets: {e}")
+        print(f"❌ 获取市场失败: {e}")
         return []
 
-# 修改 2: 将 load_tokens 改为 get_tokens
 def get_tokens():
-    """提取所有目标 Token ID"""
+    """方案 A 核心函数：提取目标 Token ID"""
     markets = get_market()
     result = []
-
     for m in markets:
         if not isinstance(m, dict) or "tokens" not in m or "question" not in m:
             continue
@@ -32,14 +34,10 @@ def get_tokens():
                     yes_token = token.get("token_id")
             
             if yes_token:
-                result.append({
-                    "name": m["question"],
-                    "token": yes_token
-                })
+                result.append({"name": m["question"], "token": yes_token})
     return result
 
-# 保持不变
 def top_markets():
-    """返回纯 ID 列表"""
-    tokens_data = get_tokens() # 注意这里同步改为调用 get_tokens
+    """返回纯 ID 列表供快速过滤"""
+    tokens_data = get_tokens()
     return [item["token"] for item in tokens_data]
