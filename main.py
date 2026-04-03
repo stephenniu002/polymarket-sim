@@ -1,33 +1,22 @@
 import asyncio
 import logging
 import os
-import requests
-
-# ⚠️ 这里的导入名必须与 market.py 保持严格一致
-from market import get_all_active_5min_markets, get_tokens, top_markets
+# 🔧 这里的导入严格按照方案 A 执行
+from market import load_tokens, top_markets
 from ws import stream
 from strategy import choose_strategy, score_signal, calc_size
 from trader import place_order, get_balance
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("LOBSTER-CORE")
-
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-def send_notification(msg):
-    if TG_TOKEN and CHAT_ID:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        try:
-            requests.post(url, json={"chat_id": CHAT_ID, "text": f"🦞 {msg}"}, timeout=5)
-        except: pass
 
 async def hunting_filter(t, data):
     if t != "TRADE": return
     token_id = data.get("token_id")
     
-    # 只在“最后一分钟”开火
-    if token_id not in top_markets(): return
+    # 过滤：只在目标 Token 列表里才处理
+    if token_id not in top_markets():
+        return
 
     strategy = choose_strategy()
     score = score_signal(data, strategy)
@@ -38,26 +27,25 @@ async def hunting_filter(t, data):
     if size <= 0: return
 
     price = float(data.get("price", 0))
-    logger.info(f"🎯 捕捉反转信号! Score: {score} | Token: {token_id[:8]}")
-    
+    logger.info(f"🎯 命中目标! Price: {price} | Token: {token_id[:8]}")
     place_order(token_id=token_id, price=price, size=size, side="BUY")
 
 async def main():
-    logger.info("🚀 龙虾加密猎手 V2.0 启动...")
+    logger.info("🚀 龙虾系统 V2.0 (方案 A) 启动...")
     while True:
         try:
-            markets = get_all_active_5min_markets()
-            listen_tokens = []
-            for m in markets:
-                y, n = get_tokens(m)
-                if y: listen_tokens.append(y)
+            # 🔧 修改后的获取方式
+            targets = load_tokens()
             
-            if not listen_tokens:
+            if not targets:
+                # logger.info("💤 等待盘口中...")
                 await asyncio.sleep(30)
                 continue
 
-            # 监听第一个活跃盘口
-            await stream(listen_tokens[0], hunting_filter)
+            # 监听第一个目标的 WebSocket
+            first_token = targets[0]["token"]
+            await stream(first_token, hunting_filter)
+            
         except Exception as e:
             logger.error(f"📡 运行异常: {e}")
             await asyncio.sleep(10)
