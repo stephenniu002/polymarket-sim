@@ -9,3 +9,5 @@ python-telegram-bot
 requests
 pydantic
 eth-account
+web3>=6.0.0
+eth-account
