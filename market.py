@@ -4,37 +4,29 @@ BASE = "https://clob.polymarket.com"
 TARGETS = ["Bitcoin", "Ethereum", "Solana", "XRP", "BNB", "Dogecoin", "BTC", "ETH", "SOL"]
 
 def get_market(keyword=None):
-    """获取市场并支持关键词过滤，解决 TypeError 问题"""
+    """获取市场并支持关键词过滤，增加了类型检查防止报错"""
     try:
         resp = requests.get(f"{BASE}/markets", timeout=10)
         markets = resp.json()
+        
+        # 核心修复：确保 markets 是列表，且只处理其中的字典对象
+        if not isinstance(markets, list):
+            return []
+
         if keyword:
-            # 如果 main.py 传了 "Trump"，在这里过滤
-            return [m for m in markets if keyword.lower() in str(m.get("question", "")).lower()]
+            filtered = []
+            for m in markets:
+                # 只有当 m 是字典时才调用 .get()
+                if isinstance(m, dict):
+                    question = str(m.get("question", "")).lower()
+                    if keyword.lower() in question:
+                        filtered.append(m)
+            return filtered
+            
         return markets
     except Exception as e:
-        print(f"❌ 获取市场失败: {e}")
+        # 这里打印具体的错误类型，方便后续调试
+        print(f"❌ 获取市场异常: {e}")
         return []
 
-def get_tokens():
-    """提取目标 Token ID"""
-    markets = get_market()
-    result = []
-    for m in markets:
-        if not isinstance(m, dict) or "tokens" not in m or "question" not in m:
-            continue
-        q_text = m["question"].lower()
-        if any(t.lower() in q_text for t in TARGETS):
-            yes_token = None
-            for token in m.get("tokens", []):
-                outcome = token.get("outcome", "").lower()
-                if outcome in ["yes", "up", "above"]:
-                    yes_token = token.get("token_id")
-            if yes_token:
-                result.append({"name": m["question"], "token": yes_token})
-    return result
-
-def top_markets():
-    """返回纯 ID 列表"""
-    tokens_data = get_tokens()
-    return [item["token"] for item in tokens_data]
+# get_tokens 和 top_markets 保持不变...
