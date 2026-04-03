@@ -1,24 +1,28 @@
-class TailStrategy:
-    def init(self):
-        self.prices = []
+import time
 
-    def update(self, price):
-        self.prices.append(price)
-        if len(self.prices) > 300:
-            self.prices.pop(0)
+buffer = []
 
-    def signal(self):
-        if len(self.prices) < 300:
-            return False
+def signal(trade):
+    now = time.time()
+    buffer.append((now, float(trade["price"])))
 
-        window = self.prices[-300:]
-        last_60 = self.prices[-60:]
+    # 保留30秒
+    global buffer
+    buffer = [(t, p) for t, p in buffer if now - t < 30]
 
-        low = min(window)
-        current = self.prices[-1]
+    if len(buffer) < 5:
+        return None
 
-        distance = (current - low) / low
-        rebound = (max(last_60) - low) / low
+    prices = [p for _, p in buffer]
+
+    # 尾部反转逻辑
+    if prices[-1] > max(prices[:-1]):
+        return "BUY"
+
+    if prices[-1] < min(prices[:-1]):
+        return "SELL"
+
+    return None
 
         # 👉 可调核心参数
         if distance < 0.003 and rebound > 0.006:
