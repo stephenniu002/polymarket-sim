@@ -3,7 +3,7 @@ import json
 import logging
 import websockets
 
-# 直接定义 WebSocket 地址，不再从 config 导入
+# 直接定义，不再从 config 导入
 CLOB_WS = "wss://clob.polymarket.com/ws"
 logger = logging.getLogger("LOBSTER-WS")
 
@@ -15,7 +15,6 @@ async def stream(token_id, callback):
         "channels": ["trades"]
     }
     
-    # 建立长连接
     async for websocket in websockets.connect(CLOB_WS):
         try:
             await websocket.send(json.dumps(payload))
@@ -23,7 +22,7 @@ async def stream(token_id, callback):
             
             async for message in websocket:
                 data = json.loads(message)
-                # 处理不同格式的交易数据
+                # 处理 Polymarket 交易推送格式
                 if isinstance(data, list):
                     for item in data:
                         await callback("TRADE", item)
