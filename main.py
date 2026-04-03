@@ -1,38 +1,61 @@
+import os
 import asyncio
 import logging
-from market import get_market, get_tokens, top_markets
-from trader import place_order, get_balance
 
-# 配置日志格式
+# ===== 1. 环境诊断逻辑 (放在最顶部，直接打印到控制台) =====
+print("🔍 --- 系统环境诊断中 ---")
+addr = os.getenv("POLY_ADDRESS")
+api_key = os.getenv("POLY_API_KEY")
+secret = os.getenv("POLY_SECRET")
+
+if not addr:
+    print("🚨 警报：代码未读取到 POLY_ADDRESS！请检查 Railway Variables 是否配置。")
+else:
+    # 只打印前 6 位和后 4 位，保护隐私
+    print(f"✅ 成功读取地址: {addr[:6]}...{addr[-4:]}")
+
+if not api_key:
+    print("🚨 警报：代码未读取到 POLY_API_KEY！")
+if not secret:
+    print("🚨 警报：代码未读取到 POLY_SECRET！")
+print("🔍 --- 诊断结束 ---")
+
+# ===== 2. 导入依赖与配置日志 =====
+from market import get_market, get_tokens, top_markets
+from trader import place_order, get_balance, safe_order
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+# ===== 3. 主程序逻辑 =====
 async def main():
     logging.info("🚀 龙虾火控系统 V2.0 已上线！")
     
+    # 增加一个交易统计计数器（可选）
+    stats = {"success": 0, "failed": 0}
+    
     while True:
         try:
-            # 1. 汇报账户状态
+            # A. 汇报账户状态
             balance = get_balance()
             logging.info(f"💰 [状态汇报] 当前账户余额: {balance} USDC")
 
-            # 2. 扫描目标市场
-            # 这里的 get_market("Trump") 现在不会再报错了
+            # B. 扫描目标市场
             targets = ["Bitcoin", "Ethereum", "Solana", "Trump"]
             for keyword in targets:
                 markets = get_market(keyword)
                 if markets:
                     logging.info(f"🔍 [监控中] {keyword} 相关市场发现 {len(markets)} 个")
 
-            # 3. 策略逻辑占位 (可以在此加入你的反转交易判断)
-            # ...
+            # C. 策略占位 (如果你在 strategy.py 有逻辑，可以这里调用)
+            # 例如: await run_strategy(stats)
 
             logging.info("✅ 本次巡检完成。系统进入静默监控，5分钟后进行下次汇报。")
             
-            # 4. 关键：休眠 5 分钟 (300秒)
+            # D. 休眠 5 分钟 (300秒)
             await asyncio.sleep(300)
 
         except Exception as e:
