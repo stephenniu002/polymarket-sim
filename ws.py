@@ -1,34 +1,27 @@
 import asyncio
-import json
-import logging
 import websockets
+import json
+from config import CLOB_WS
 
-# 直接定义，不再从 config 导入
-CLOB_WS = "wss://clob.polymarket.com/ws"
-logger = logging.getLogger("LOBSTER-WS")
-
-async def stream(token_id, callback):
-    """监听 WebSocket 并回调 hunting_filter"""
-    payload = {
-        "type": "subscribe",
-        "assets_ids": [token_id],
-        "channels": ["trades"]
-    }
-    
-    async for websocket in websockets.connect(CLOB_WS):
+async def stream(token, callback):
+    while True:
         try:
-            await websocket.send(json.dumps(payload))
-            logger.info(f"📡 监听开启: {token_id[:8]}...")
-            
-            async for message in websocket:
-                data = json.loads(message)
-                # 处理 Polymarket 交易推送格式
-                if isinstance(data, list):
-                    for item in data:
-                        await callback("TRADE", item)
-                else:
-                    await callback("TRADE", data)
-                    
+            print(f"🔌 连接 WS: {token}")
+
+            async with websockets.connect(CLOB_WS, ping_interval=20) as ws:
+                await ws.send(json.dumps({
+                    "type": "subscribe",
+                    "channel": "trades",
+                    "token_id": token
+                }))
+
+                while True:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+
+                    if "price" in data:
+                        await callback(data)
+
         except Exception as e:
-            logger.warning(f"🔄 连接中断 ({e})，5秒后重连...")
+            print(f"⚠️ WS断线: {e}，5秒重连...")
             await asyncio.sleep(5)
