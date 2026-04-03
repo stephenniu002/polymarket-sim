@@ -1,124 +1,168 @@
 import asyncio
-import logging
-import os
-import requests
-
-# 1. 导入你仓库里的模块 (确保这些文件里也没有 import config)
-from market import get_all_active_5min_markets, get_tokens, top_markets
+import time
+from market import load_tokens
 from ws import stream
-from strategy import choose_strategy, score_signal, calc_size
-from trader import place_order, get_balance
+from strategy import Strategy
+from trader import safe_order, positions, save_positions, load_positions
+from reporter import Reporter
+from config import TRADE_SIZE
 
-# 2. 基础日志配置
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("LOBSTER-CORE")
+# ===== 初始化 =====
+reporter = Reporter()
+balance = 1000
+market_score = {}
+last_trade_time = {}
+strategies_stats = {
+    "tail": {"win": 1, "lose": 1},
+    "deep": {"win": 1, "lose": 1}
+}
 
-# 3. 从 Railway 环境变量读取配置 (无需 config.py)
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ===== 工具函数 =====
 
-def send_notification(msg):
-    """战报推送至 Telegram"""
-    if TG_TOKEN and CHAT_ID:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        try:
-            payload = {"chat_id": CHAT_ID, "text": f"🦞 {msg}", "parse_mode": "Markdown"}
-            requests.post(url, json=payload, timeout=5)
-        except Exception as e:
-            logger.error(f"TG推送失败: {e}")
+def update_market_score(token, size):
+    market_score[token] = market_score.get(token, 0) + size
 
-# 4. 核心猎杀逻辑：最后一分钟反转
-async def hunting_filter(t, data):
-    """
-    WS 数据回调：只在最后 60 秒识别超跌/超涨信号
-    """
-    if t != "TRADE":
-        return
+def top_markets():
+    sorted_m = sorted(market_score.items(), key=lambda x: x[1], reverse=True)
+    return [m[0] for m in sorted_m[:2]]
 
-    try:
-        token_id = data.get("token_id")
-        
-        # A. 时间窗口过滤：只打“最后一分钟”白名单里的 Token
-        # top_markets() 会根据 market.py 里的 is_last_minute 判断
-        active_whitelist = top_markets()
-        if token_id not in active_whitelist:
+def winrate(name):
+    s = strategies_stats[name]
+    total = s["win"] + s["lose"]
+    return s["win"] / total if total else 0.5
+
+def kelly(wr, rr=2):
+    return max(0, wr - (1 - wr) / rr)
+
+def calc_size(balance, strategy):
+    wr = winrate(strategy)
+    k = min(kelly(wr), 0.2)
+    return balance * k
+
+def can_trade(token):
+    now = time.time()
+    if token in last_trade_time and now - last_trade_time[token] < 300:
+        return False
+    last_trade_time[token] = now
+    return True
+
+# ===== 核心市场逻辑 =====
+
+async def run_market(m):
+    global balance
+
+    strat = Strategy()
+    token = m["token"]
+
+    async def on_msg(data):
+        global balance
+
+        price = float(data["price"])
+        size = float(data["size"])
+
+        strat.update(price, size)
+        update_market_score(token, size)
+
+        # ===== 策略信号 =====
+        sig = strat.signal()
+        if not sig:
             return
 
-        # B. 策略研判：买入反转信号
-        current_strategy = choose_strategy() # 确保 strategy.py 适配 5min 盘
-        score = score_signal(data, current_strategy)
-        
-        if score < 2:
+        # ===== 市场筛选 =====
+        if token not in top_markets():
             return
 
-        # C. 仓位控制：读取实盘余额
-        balance = get_balance()
-        size = calc_size(balance, current_strategy)
-
-        if size <= 0:
-            logger.warning("💸 余额不足或仓位计算为 0，跳过本次狙击")
+        # ===== 冷却 =====
+        if not can_trade(token):
             return
 
-        # D. 执行实盘下单
-        price = float(data.get("price", 0))
-        logger.info(f"🎯 发现反转机会! 分数: {score} | 规模: {size} | Token: {token_id[:8]}")
-        
-        # 调用 trader.py 里的下单逻辑
-        order_res = place_order(
-            token_id=token_id,
-            price=price,
-            size=size,
-            side="BUY"
-        )
+        # ===== 策略选择 =====
+        strategy = "deep" if price < 0.2 else "tail"
 
-        # E. 实时战报
-        if order_res and "orderID" in str(order_res):
-            msg = (
-                f"*【末日反转成交】*\n"
-                f"💰 价格: {price}\n"
-                f"📊 规模: {size}\n"
-                f"⭐ 评分: {score}\n"
-                f"🕒 窗口: 最后一分钟"
-            )
-            send_notification(msg)
+        # ===== 仓位 =====
+        trade_size = calc_size(balance, strategy)
+        if trade_size <= 0:
+            return
 
-    except Exception as e:
-        logger.error(f"💥 核心循环报错: {e}")
+        # ===== 下单 =====
+        res = safe_order(token, price, trade_size, "BUY")
 
-# 5. 主程序入口
-async def main():
-    logger.info("🌊 龙虾高频猎手 V2.0 启动成功！")
-    send_notification("🚀 龙虾系统已上线，正在扫描 7 大加密 5min 盘口...")
-    
+        if not res:
+            return
+
+        positions[token] = {
+            "entry": price,
+            "size": trade_size,
+            "sold": False,
+            "strategy": strategy
+        }
+
+        save_positions()
+
+        print(f"🟢 BUY {token} {price} size={trade_size}")
+
+    await stream(token, on_msg)
+
+# ===== 持仓管理 =====
+
+async def manage_positions():
+    global balance
+
     while True:
-        try:
-            # 获取当前所有 5min 加密盘口的 Token 列表
-            markets = get_all_active_5min_markets()
-            listen_tokens = []
-            
-            for m in markets:
-                y, n = get_tokens(m)
-                if y: listen_tokens.append(y)
-                if n: listen_tokens.append(n)
+        for token, pos in list(positions.items()):
+            price = pos.get("last_price", pos["entry"])
 
-            if not listen_tokens:
-                # logger.info("💤 暂无活跃 5min 盘口，休息 30 秒...")
-                await asyncio.sleep(30)
-                continue
+            # 🎯 0.50 卖75%
+            if price >= 0.5 and not pos["sold"]:
+                sell_size = pos["size"] * 0.75
+                safe_order(token, price, sell_size, "SELL")
 
-            # 开启 WebSocket 监听第一个热门 Token
-            # 注意：如果 ws.py 的 stream 逻辑只能听一个，这里建议优先听 BTC/ETH
-            await stream(listen_tokens[0], hunting_filter)
-            
-        except Exception as e:
-            logger.error(f"📡 监听异常，10秒后重启: {e}")
-            await asyncio.sleep(10)
+                pos["size"] *= 0.25
+                pos["sold"] = True
+
+            # 🔒 回撤保护
+            if pos["sold"] and price < 0.45:
+                safe_order(token, price, pos["size"], "SELL")
+
+                pnl = (price - pos["entry"]) * pos["size"]
+                balance += pnl
+
+                # 📊 记录
+                strat = pos["strategy"]
+                if pnl > 0:
+                    strategies_stats[strat]["win"] += 1
+                else:
+                    strategies_stats[strat]["lose"] += 1
+
+                reporter.record_trade(token, pnl, strat)
+                reporter.update_balance(balance)
+
+                positions.pop(token)
+                save_positions()
+
+        await asyncio.sleep(5)
+
+# ===== 心跳 =====
+
+async def heartbeat():
+    while True:
+        print(f"💓 alive | balance={balance:.2f}")
+        await asyncio.sleep(60)
+
+# ===== 主入口 =====
+
+async def main():
+    load_positions()
+
+    markets = load_tokens()
+
+    tasks = [run_market(m) for m in markets]
+
+    await asyncio.gather(
+        *tasks,
+        manage_positions(),
+        heartbeat()
+    )
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 指挥部收到撤离信号，系统关闭。")
+    asyncio.run(main())
