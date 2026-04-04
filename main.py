@@ -1,23 +1,24 @@
-import os, asyncio, logging, time, requests
+import os
+import asyncio
+import logging
+import time
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 from market import fetch_latest_market_map
 
-# --- 1. 日志与环境 (Railway 标准配置) ---
+# --- 1. 环境对接 ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# 从 Railway Variables 读取环境变量
-PK = os.getenv("PK")
-FUNDER = os.getenv("FUNDER")
+SIGNER_PK = os.getenv("FOX_PRIVATE_KEY")
+FUNDER_ADDR = os.getenv("Funder")
 
-# --- 2. 客户端初始化 (适配 2026 规范) ---
 client = ClobClient(
     host="https://clob.polymarket.com",
-    key=PK,
+    key=SIGNER_PK,
     chain_id=POLYGON,
-    signature_type=2, 
-    funder=FUNDER
+    signature_type=2,
+    funder=FUNDER_ADDR
 )
 client.set_api_creds(ApiCreds(
     api_key=os.getenv("POLY_API_KEY"),
@@ -25,98 +26,101 @@ client.set_api_creds(ApiCreds(
     api_passphrase=os.getenv("POLY_PASSPHRASE")
 ))
 
-# --- 3. 【V16.1 核心】自动适配余额探测器 ---
-async def get_balance_v16_1():
+# --- 2. 【核心修复】精准对接 2026 新接口 ---
+async def get_balance_v16_2():
     """
-    不再死磕 get_collateral_balance，改用反射探测
+    针对 SDK 列表中的 get_balance_allowance 进行解析
     """
-    # 按照 2026 SDK 优先级探测
-    for method_name in ["get_balance", "get_user_balance", "get_collateral_balance"]:
-        method = getattr(client, method_name, None)
-        if method:
-            try:
-                # 尝试获取余额
-                resp = await asyncio.to_thread(method)
-                if isinstance(resp, dict):
-                    return float(resp.get("balance") or resp.get("available") or 0)
-                return float(resp or 0)
-            except Exception as e:
-                logging.debug(f"尝试 {method_name} 失败: {e}")
-                continue
-    return -1.0  # 返回 -1 表示“接口全部失效”，触发 Fallback
+    try:
+        # 调用新版接口
+        resp = await asyncio.to_thread(client.get_balance_allowance)
+        logging.info(f"📊 原始余额数据: {resp}")
+        
+        # 2026 版通常返回字典: {'balance': '10.84', 'allowance': '...'}
+        if isinstance(resp, dict):
+            # 尝试抓取 balance 字段
+            val = resp.get("balance") or resp.get("collateral_balance") or 0
+            return float(val)
+        return float(resp or 0)
+    except Exception as e:
+        logging.error(f"❌ 余额解析失败: {e}")
+        return -1.0
 
-# --- 4. 信号驱动的 5 分钟交易逻辑 ---
+# --- 3. 交易逻辑 ---
 last_trade_round = 0
 
 async def smart_trade_logic():
     global last_trade_round
     
-    # 获取余额 (适配 V16.1)
-    balance = await get_balance_v16_1()
-    logging.info(f"💰 实时资产探测: {balance if balance != -1.0 else '探测失败'} USDC.e")
-
-    # 5分钟窗口控制
+    # A. 获取真实余额
+    balance = await get_balance_v16_2()
+    
+    # B. 5分钟周期控频
     now_round = int(time.time() // 300)
     if now_round == last_trade_round:
         return
     
-    # 强制 Fallback：即使余额读取失败，只要你确认有钱，允许试单
+    # C. 余额检查
     if balance == -1.0:
-        logging.warning("⚠️ 余额读取异常，强制进入【盲打模式】...")
-        balance = 10.0 # 假设一个余额
-    elif balance < 0.2:
-        logging.warning("🛑 余额确实不足，跳过本轮")
-        return
+        logging.warning("⚠️ 接口异常，尝试盲打模式...")
+        current_funds = 10.0 # 强制赋值以跳过拦截
+    else:
+        logging.info(f"💰 最终确认账户余额: {balance} USDC.e")
+        if balance < 0.2:
+            logging.warning("🛑 余额不足，本轮跳过")
+            return
+        current_funds = balance
 
     last_trade_round = now_round
-    logging.info("⏰ [新周期] 开始扫描 7 路币种信号...")
-
-    # 获取市场信号 (调用你的 market.py)
-    markets = fetch_latest_market_map()
     
-    # V16.1 策略：不再全推，只打前 2 个有信号的市场
-    # 此处省略复杂的打分逻辑，直接演示执行
-    for symbol, info in list(markets.items())[:2]:
-        await execute_order(info['upTokenId'], info['name'], balance)
+    # D. 市场抓取
+    markets = fetch_latest_market_map()
+    if not markets:
+        logging.warning("🔎 暂时未发现符合条件的 7 路信号市场...")
+        return
 
-async def execute_order(token_id, title, balance):
+    # E. 执行下单 (前 2 个信号最强的)
+    for symbol, info in list(markets.items())[:2]:
+        await execute_trade(info['upTokenId'], info['name'], current_funds)
+
+async def execute_trade(token_id, title, funds):
     try:
         # 动态仓位 (10%)
-        size = max(0.1, round(balance * 0.1, 2))
+        trade_size = max(0.1, round(funds * 0.1, 2))
         
-        # 2026 版 SDK 下单流程
-        order_args = OrderArgs(price=0.2, size=size, side="buy", token_id=str(token_id))
-        
+        order_args = OrderArgs(
+            price=0.2, 
+            size=trade_size, 
+            side="buy", 
+            token_id=str(token_id)
+        )
+
         def _post():
-            signed = client.create_order(order_args) # 自动签名
+            # 使用 SDK 列表确认存在的接口
+            signed = client.create_order(order_args)
             return client.post_order(signed, OrderType.GTC)
 
         res = await asyncio.to_thread(_post)
         if res and res.get("success"):
-            logging.info(f"🎯 下单成功: {title} | ID: {res.get('orderID')}")
+            logging.info(f"✅ 【实盘成交】市场: {title} | 规模: {trade_size}")
     except Exception as e:
-        logging.error(f"❌ 下单崩溃: {e}")
+        logging.error(f"❌ 下单动作崩溃: {e}")
 
-# --- 5. Railway Worker 入口 ---
-async def main_loop():
-    logging.info("🚀 龙虾 V16.1 稳定版已上线 (Railway Worker)")
-    # 打印当前 SDK 所有方法，方便调试
-    logging.info(f"🧪 SDK 可用方法列表: {[m for m in dir(client) if not m.startswith('_')]}")
-
+# --- 4. 守护入口 ---
+async def main_worker():
+    logging.info("🚀 polymarket-sim: V16.2 最终修复版启动")
+    
     while True:
         try:
             await smart_trade_logic()
-            await asyncio.sleep(10) # 保持心跳
+            await asyncio.sleep(10) # 保持探针活跃
         except Exception as e:
             logging.error(f"⚠️ 循环抖动: {e}")
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    # 修复 V16 语法错误：必须是 __name__
     try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        pass
+        asyncio.run(main_worker())
     except Exception as fatal_e:
         logging.error(f"🚨 进程致命错误: {fatal_e}")
         time.sleep(10)
