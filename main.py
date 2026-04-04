@@ -6,147 +6,130 @@ from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 from py_clob_client.clob_types import ApiCreds
 
-# ==================== 1. 严格对齐 Railway 环境变量 ====================
-# 签名：使用小狐狸私钥
-SIGNER_PK = os.getenv("FOX_PRIVATE_KEY")
-# 出钱：使用 Polymarket 充值地址 (Funder)
-FUNDER_ADDR = os.getenv("Funder") 
-# 模式：从变量读取并强制转为整数
-SIG_TYPE = int(os.getenv("signature_type", 2))
+# ==================== 1. 配置对齐 ====================
+SIGNER_PK = os.getenv("FOX_PRIVATE_KEY")      # 小狐狸私钥
+FUNDER_ADDR = os.getenv("Funder")             # Polymarket 充值地址 (有钱的那个)
 
 # API 凭证
-POLY_KEY = os.getenv("POLY_API_KEY")
-POLY_SECRET = os.getenv("POLY_SECRET")
-POLY_PASS = os.getenv("POLY_PASSPHRASE")
+POLY_CREDS = ApiCreds(
+    api_key=os.getenv("POLY_API_KEY"),
+    api_secret=os.getenv("POLY_SECRET"),
+    api_passphrase=os.getenv("POLY_PASSPHRASE")
+)
 
-# Telegram 配置 (匹配截图中的变量名)
+# 策略参数
+ORDER_AMOUNT = 1.0        # 每笔固定投入 1 USDC
+PRICE_LIMIT = 0.2         # 捡漏门槛：价格 <= 0.2
+SCAN_INTERVAL = 60        # 扫描间隔 (秒)
+
+ASSETS = ["Bitcoin Price Above", "Ethereum Price Above", "Solana Price Above", "XRP Price Above"]
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TG_BOT_TOKEN = os.getenv("TG_TOKEN")
+TG_TOKEN = os.getenv("TG_TOKEN")
+# ====================================================
 
-# 下单设置
-ORDER_SIZE = float(os.getenv("ORDER_SIZE", 1.0))
-# ====================================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-def send_tg_msg(text: str):
-    if TG_BOT_TOKEN and TG_CHAT_ID:
+def send_tg(text: str):
+    if TG_TOKEN and TG_CHAT_ID:
         try:
-            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-            requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
-        except Exception as e:
-            logging.error(f"Telegram 发送失败: {e}")
+            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": TG_CHAT_ID, "text": text}, timeout=5)
+        except: pass
 
-def get_polymarket_client():
-    """初始化 ClobClient，确保签名与出金地址分离"""
-    client = ClobClient(
-        host="https://clob.polymarket.com",
-        key=SIGNER_PK,
-        chain_id=POLYGON,
-        signature_type=SIG_TYPE,
-        funder=FUNDER_ADDR
-    )
-    client.set_api_creds(ApiCreds(
-        api_key=POLY_KEY,
-        api_secret=POLY_SECRET,
-        api_passphrase=POLY_PASS
-    ))
-    return client
+# 初始化客户端 (签名者 + 出资者模式)
+client = ClobClient(
+    host="https://clob.polymarket.com", 
+    key=SIGNER_PK, 
+    chain_id=POLYGON, 
+    signature_type=2, 
+    funder=FUNDER_ADDR
+)
+client.set_api_creds(POLY_CREDS)
 
-# 全局初始化客户端
-pm_client = get_polymarket_client()
-
-async def get_funder_balance():
-    """查询 Funder 地址的 USDC 余额"""
+async def get_real_balance():
+    """
+    核心修复：强制查询 FUNDER_ADDR 在 Polymarket 协议内的可用余额
+    """
     try:
-        # 在代理模式下，SDK 会自动查询 funder 的 collateral 余额
-        resp = await asyncio.to_thread(pm_client.get_collateral_balance)
+        # SDK 0.34+ 建议用法：显式传入地址查询
+        resp = await asyncio.to_thread(client.get_collateral_balance, FUNDER_ADDR)
         if resp and isinstance(resp, dict):
-            balance = round(float(resp.get("balance", 0)), 2)
-            logging.info(f"💰 [资金池检查] 余额: {balance} USDC")
-            return balance
+            # 有些版本返回 'balance', 有些返回 'collateral_balance'
+            raw_val = resp.get("balance") or resp.get("collateral_balance") or 0
+            return round(float(raw_val), 2)
     except Exception as e:
-        logging.error(f"❌ 余额查询异常: {e}")
+        logging.error(f"❌ 余额读取失败: {e}")
     return 0.0
 
-def fetch_active_token(asset_keyword: str):
-    """动态抓取最热门市场的 Token ID"""
-    url = "https://gamma-api.polymarket.com/markets"
-    params = {"active": "true", "closed": "false", "search": asset_keyword, "limit": 5}
+def get_market_data(asset: str):
+    """动态获取 Token ID"""
     try:
-        resp = requests.get(url, params=params, timeout=10).json()
-        # 筛选出有 Token 的有效市场
-        valid_markets = [m for m in resp if m.get("clobTokenIds")]
-        if valid_markets:
-            # 选取成交量最大的市场（确保流动性）
-            best_m = max(valid_markets, key=lambda x: float(x.get("volume", 0)))
-            # [0] 为 Yes/Above，[1] 为 No/Below
-            return best_m["clobTokenIds"][0], best_m.get("question")
+        res = requests.get("https://gamma-api.polymarket.com/markets", 
+                           params={"active": "true", "search": asset, "limit": 3}).json()
+        valid = [m for m in res if m.get("clobTokenIds")]
+        if valid:
+            m = max(valid, key=lambda x: float(x.get("volume", 0)))
+            return m["clobTokenIds"][0], m.get("question")
     except: pass
     return None, None
 
-async def execute_trade_task(asset: str):
-    """下单执行逻辑"""
-    token_id, market_title = fetch_active_token(asset)
-    if not token_id:
-        logging.warning(f"⚠️ 未找到有效市场: {asset}")
-        return False
+async def trade_task(asset: str):
+    """单路捡漏：查价 -> 计算份数 -> 下单"""
+    token_id, title = get_market_data(asset)
+    if not token_id: return False
     
     try:
-        def _sync_trade():
-            # 创建订单 -> 签名 -> 提交
-            order_args = pm_client.create_order(
-                price=0.5, # 示例限价 0.5
-                size=ORDER_SIZE,
-                side="buy",
-                token_id=token_id
-            )
-            signed = pm_client.sign_order(order_args)
-            return pm_client.place_order(signed)
+        # 获取当前买入单价
+        p_res = await asyncio.to_thread(client.get_price, token_id, side="BUY")
+        price = float(p_res.get("price", 1.0))
+        
+        logging.info(f"🔍 {asset[:7]}.. 现价: {price}")
 
-        res = await asyncio.to_thread(_sync_trade)
-        if res and res.get("success"):
-            logging.info(f"✅ 成功下单: {market_title}")
-            return True
-        else:
-            logging.error(f"❌ 下单未成交: {res}")
+        if 0 < price <= PRICE_LIMIT:
+            # 计算份数：投入 1 USDC / 单价 = 购买份数
+            shares = round(ORDER_AMOUNT / price, 2)
+            
+            logging.info(f"🎯 触发捡漏! 价格 {price} <= {PRICE_LIMIT}. 计划买入 {shares} 份")
+            
+            def _place():
+                args = client.create_order(price=price, size=shares, side="buy", token_id=token_id)
+                signed = client.sign_order(args)
+                return client.place_order(signed)
+
+            res = await asyncio.to_thread(_place)
+            if res and res.get("success"):
+                logging.info(f"✅ 成功成交: {title}")
+                return True
     except Exception as e:
-        logging.error(f"❌ 交易执行异常 {asset}: {e}")
+        logging.warning(f"⚠️ {asset} 任务跳过: {e}")
     return False
 
-async def main_strategy_loop():
-    logging.info("🚀 龙虾实盘 V6.2 适配版启动成功")
-    send_tg_msg("🦞 龙虾实盘已上线！\n已精准适配 Railway 环境变量。")
-    
-    assets_to_watch = ["Bitcoin Price Above", "Ethereum Price Above", "Solana Price Above"]
+async def main_loop():
+    logging.info("🚀 龙虾实盘 V6.8 上线 (Funder 模式)")
+    send_tg("🦞 龙虾实盘已启动！\n监控地址: " + FUNDER_ADDR[:10] + "...")
     
     while True:
         try:
-            current_balance = await get_funder_balance()
+            # 1. 检查 Polymarket 协议内的资金
+            balance = await get_real_balance()
+            logging.info(f"💰 Polymarket 可用资金: {balance} USDC")
             
-            if current_balance >= ORDER_SIZE:
-                tasks = [execute_trade_task(a) for a in assets_to_watch]
+            if balance >= ORDER_AMOUNT:
+                # 2. 并发扫描 7 个币种
+                tasks = [trade_task(a) for a in ASSETS]
                 results = await asyncio.gather(*tasks)
                 
-                success_num = sum(1 for r in results if r)
-                if success_num > 0:
-                    send_tg_msg(f"🦞 轮询完成\n成功下单: {success_num} 个市场\n剩余余额: {current_balance} USDC")
+                success_count = sum(1 for r in results if r)
+                if success_count > 0:
+                    new_bal = await get_real_balance()
+                    send_tg(f"✅ 捡漏成功！\n成交笔数: {success_count}\n剩余资金: {new_bal} USDC")
             else:
-                logging.warning(f"🛑 资金不足 (仅剩 {current_balance} USDC)，等待充值...")
-
+                logging.warning(f"🛑 资金不足 ({balance} < {ORDER_AMOUNT})，请往 Funder 地址充值并 Deposit 到 Polymarket")
+                
         except Exception as e:
-            logging.error(f"⚠️ 核心循环异常: {e}")
+            logging.error(f"⚠️ 循环异常: {e}")
             
-        await asyncio.sleep(600) # 每10分钟扫描一轮
+        await asyncio.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_strategy_loop())
-    except KeyboardInterrupt:
-        pass
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("用户停止程序")
+    asyncio.run(main_loop())
