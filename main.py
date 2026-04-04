@@ -1,54 +1,123 @@
-async def get_balance():
-    """
-    终极兼容版：自动探测 SDK 余额接口并解析多种返回格式
-    """
+import os
+import asyncio
+import logging
+import requests
+from py_clob_client.client import ClobClient
+from py_clob_client.constants import POLYGON
+from py_clob_client.clob_types import ApiCreds
+
+# ========= 基础配置 =========
+SIGNER_PK = os.getenv("FOX_PRIVATE_KEY")
+FUNDER = os.getenv("Funder")
+
+TG_TOKEN = os.getenv("TG_TOKEN")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+ORDER_SIZE = 1.0
+TEST_PRICE = 0.99   # 🔥 强制成交用（关键）
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+
+print("🚨 文件已启动")
+
+# ========= TG =========
+def send_tg(msg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
     try:
-        def _get():
-            # 1. 探测 SDK 支持哪种方法名
-            method_name = None
-            for m in ["get_collateral_balance", "get_balance", "get_user_balance"]:
-                if hasattr(client, m):
-                    method_name = m
-                    break
-            
-            if not method_name:
-                raise Exception("SDK 不支持任何已知的余额接口")
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        logging.error(f"TG发送失败: {e}")
 
-            func = getattr(client, method_name)
-            
-            # 2. 尝试不同的调用方式 (有些版本必须传地址，有些不用)
-            try:
-                # 优先尝试传参调用 (Funder 模式常用)
-                return func(FUNDER)
-            except TypeError:
-                # 如果报错参数过多，则尝试不带参数调用
-                return func()
+# ========= 客户端 =========
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    key=SIGNER_PK,
+    chain_id=POLYGON,
+    signature_type=2,
+    funder=FUNDER
+)
 
-        # 在线程池中执行同步 SDK 方法，防止阻塞协程
-        resp = await asyncio.to_thread(_get)
+client.set_api_creds(ApiCreds(
+    api_key=os.getenv("POLY_API_KEY"),
+    api_secret=os.getenv("POLY_SECRET"),
+    api_passphrase=os.getenv("POLY_PASSPHRASE")
+))
 
-        # DEBUG 日志，帮助你在 Railway 后台看到原始数据结构
-        logging.debug(f"🔍 余额接口原始返回: {resp}")
+# ========= 获取市场 =========
+def get_best_market():
+    try:
+        url = "https://gamma-api.polymarket.com/markets"
+        data = requests.get(url, params={"active": "true", "limit": 20}, timeout=10).json()
 
-        # 3. 通用解析逻辑：适配字典返回或直接数值返回
-        balance = 0.0
-        if isinstance(resp, dict):
-            # 尝试所有可能的 key: balance, collateral_balance, available
-            val = resp.get("balance") or resp.get("collateral_balance") or resp.get("available") or 0
-            balance = float(val)
-        elif isinstance(resp, (int, float, str)):
-            balance = float(resp)
-        else:
-            # 如果返回的是特殊对象，尝试读取属性
-            balance = float(getattr(resp, "balance", 0))
+        valid = [m for m in data if m.get("clobTokenIds")]
+        best = max(valid, key=lambda x: float(x.get("volume", 0)))
 
-        logging.info(f"💰 账户可用余额: {balance} USDC")
-        return balance
+        return best["clobTokenIds"][0], best.get("question")
+    except Exception as e:
+        logging.error(f"❌ 市场获取失败: {e}")
+        return None, None
+
+# ========= 下单 =========
+async def force_trade():
+    token_id, title = get_best_market()
+
+    if not token_id:
+        logging.warning("⚠️ 没找到市场")
+        return
+
+    logging.info(f"🎯 市场: {title}")
+
+    try:
+        def _trade():
+            order = client.create_order(
+                price=TEST_PRICE,
+                size=ORDER_SIZE,
+                side="buy",
+                token_id=str(token_id)
+            )
+            signed = client.sign_order(order)
+            return client.place_order(signed)
+
+        res = await asyncio.to_thread(_trade)
+
+        logging.info(f"📥 返回: {res}")
+
+        send_tg(f"""
+🦞 下单测试
+市场: {title}
+结果: {res}
+""")
 
     except Exception as e:
-        logging.error(f"❌ 余额读取失败: {e}")
-        return 0.0
+        logging.error(f"❌ 下单异常: {e}")
+        send_tg(f"❌ 下单异常: {e}")
 
-        asyncio.run(main())
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
+# ========= 主循环 =========
+async def main():
+    logging.info("🚀 系统启动成功")
+    send_tg("🚀 系统已启动（测试版）")
+
+    counter = 0
+
+    while True:
+        try:
+            logging.info("🔁 循环中...")
+
+            await force_trade()
+
+            counter += 1
+
+            # 每5轮报告一次
+            if counter % 5 == 0:
+                send_tg("📊 系统正常运行中（5轮心跳）")
+
+        except Exception as e:
+            logging.error(f"⚠️ 主循环异常: {e}")
+
+        await asyncio.sleep(60)
+
+# ========= 启动 =========
+if __name__ == "__main__":
+    asyncio.run(main())
