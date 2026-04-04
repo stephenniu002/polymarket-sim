@@ -1,72 +1,26 @@
-import os
+import requests
 import logging
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON, ETH  # POLYGON/ETH/其它链
 
-logging.basicConfig(level=logging.INFO)
-
-SIGNATURE_TYPE_PROXY = 2  # 使用代理钱包
-
-def get_client():
-    """
-    初始化 ClobClient（0.34.6 版本兼容写法）
-    """
-    client = ClobClient(
-        host="https://clob.polymarket.com",
-        key=os.getenv("POLY_PRIVATE_KEY"),    # 私钥
-        funder=os.getenv("POLY_ADDRESS"),     # 钱包地址
-        chain_id=POLYGON,
-        signature_type=SIGNATURE_TYPE_PROXY
-    )
-
-    # ✅ 通过 set_api_creds 注入 API Key/Secret/Passphrase
-    client.set_api_creds(
-        api_key=os.getenv("POLY_API_KEY"),
-        api_secret=os.getenv("POLY_SECRET"),
-        api_passphrase=os.getenv("POLY_PASSPHRASE")
-    )
-    return client
-
-client = get_client()
-
-def get_balance():
+def get_latest_market(asset="Bitcoin"):
+    """直接从 Polymarket 抓取当前最新的盘口 ID"""
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {
+        "active": "true",
+        "closed": "false",
+        "search": f"{asset} Price",
+        "limit": 5
+    }
     try:
-        resp = client.get_collateral_balance(os.getenv("POLY_ADDRESS"))
-        balance = round(float(resp.get("balance", 0)), 2)
-        logging.info(f"💰 当前账户余额: {balance} USDC")
-        return balance
+        resp = requests.get(url, params=params, timeout=10).json()
+        # 寻找包含 'above' 的主价格盘
+        valid = [m for m in resp if "above" in m.get("question", "").lower() and m.get("clobTokenIds")]
+        if valid:
+            # 选成交量最高的盘口
+            m = max(valid, key=lambda x: float(x.get("volume", 0)))
+            return {
+                "question": m.get("question"),
+                "token_id": m.get("clobTokenIds")[0] # Yes Token
+            }
     except Exception as e:
-        logging.error(f"❌ 查询余额失败: {e}")
-        return 0.0
-
-def execute_trade(token_id, price=0.5, size=1.0, side="buy"):
-    try:
-        order_args = client.create_order(
-            token_id=str(token_id),
-            price=float(price),
-            size=float(size),
-            side=side
-        )
-        signed_order = client.sign_order(order_args)
-        result = client.place_order(signed_order)
-        logging.info(f"✅ 下单成功: {result}")
-        return result
-    except Exception as e:
-        logging.error(f"❌ 下单失败: {e}")
-        return None
-
-def fetch_latest_token_id(symbol: str):
-    """
-    动态抓取市场最新 token_id
-    symbol: "BTC", "ETH", "SOL" ...
-    """
-    try:
-        markets = client.get_markets()
-        for m in markets:
-            if m["symbol"] == symbol:
-                return m["token_id"]
-        logging.warning(f"⚠️ 未找到 {symbol} 市场")
-        return None
-    except Exception as e:
-        logging.error(f"❌ 获取 token_id 失败: {e}")
-        return None
+        logging.error(f"📡 扫描 {asset} 盘口失败: {e}")
+    return None
