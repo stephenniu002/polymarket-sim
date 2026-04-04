@@ -46,7 +46,7 @@ client.set_api_creds(ApiCreds(
     api_passphrase=os.getenv("POLY_PASSPHRASE")
 ))
 
-# ========= ✅ 终极余额兼容 =========
+# ========= ✅ 终极余额 =========
 async def get_balance():
     try:
         def _get():
@@ -61,8 +61,10 @@ async def get_balance():
 
         resp = await asyncio.to_thread(_get)
 
+        logging.info(f"🔍 原始余额返回: {resp}")
+
         if isinstance(resp, dict):
-            val = resp.get("balance") or resp.get("available") or 0
+            val = resp.get("balance") or resp.get("available") or resp.get("collateral_balance") or 0
             return float(val)
 
         return float(resp)
@@ -71,16 +73,19 @@ async def get_balance():
         logging.error(f"❌ 余额失败: {e}")
         return 0.0
 
-# ========= 获取最大市场 =========
+# ========= 获取最活跃市场 =========
 def get_best_market():
     try:
         data = requests.get(
             "https://gamma-api.polymarket.com/markets",
-            params={"active": "true", "limit": 20},
+            params={"active": "true", "closed": "false", "limit": 50},
             timeout=10
         ).json()
 
         valid = [m for m in data if m.get("clobTokenIds")]
+
+        if not valid:
+            return None, None
 
         best = max(valid, key=lambda x: float(x.get("volume", 0)))
 
@@ -95,41 +100,37 @@ async def trade_once():
     token_id, title = get_best_market()
 
     if not token_id:
-        return "❌ 无市场"
+        return "❌ 无可用市场"
 
     logging.info(f"🎯 市场: {title}")
 
     try:
         def _trade():
-            # 🔥 关键：不用 create_order
-            order = {
+            return client.place_order({
                 "token_id": str(token_id),
                 "price": float(TARGET_PRICE),
                 "size": float(ORDER_SIZE),
                 "side": "BUY"
-            }
-
-            signed = client.sign_order(order)
-            return client.place_order(signed)
+            })
 
         res = await asyncio.to_thread(_trade)
 
         logging.info(f"📥 下单返回: {res}")
 
         if res and (res.get("orderID") or res.get("success")):
-            return f"✅ 成功\n{title}"
+            return f"✅ 成功下单\n{title}"
         else:
             return f"⚠️ 未成交\n{res}"
 
     except Exception as e:
-        return f"❌ 崩溃: {e}"
+        return f"❌ 下单崩溃: {e}"
 
 # ========= 主循环 =========
 async def main():
-    logging.info("🚀 V9 实盘启动")
-    send_tg("🦞 V9 已启动")
+    logging.info("🚀 V10 实盘启动")
+    send_tg("🦞 V10 已启动（最终稳定版）")
 
-    report_counter = 0
+    counter = 0
 
     while True:
         try:
@@ -139,19 +140,17 @@ async def main():
             result = await trade_once()
 
             logging.info(result)
-
-            # ===== 每轮推送 =====
             send_tg(f"{result}\n余额: {balance}")
 
-            report_counter += 1
+            counter += 1
 
-            # ===== 每 5 分钟总结 =====
-            if report_counter >= 5:
-                send_tg(f"📊 5分钟状态\n余额: {balance}")
-                report_counter = 0
+            # 每 5 分钟报告
+            if counter >= 5:
+                send_tg(f"📊 5分钟报告\n余额: {balance}")
+                counter = 0
 
         except Exception as e:
-            logging.error(f"循环错误: {e}")
+            logging.error(f"⚠️ 主循环异常: {e}")
 
         await asyncio.sleep(60)
 
