@@ -1,17 +1,21 @@
 import requests
 import logging
 
+# 基础配置
 BASE_GAMMA = "https://gamma-api.polymarket.com"
-# 保持和你 JSON 一致的目标币种
-TARGETS = ["BTC", "ETH", "SOL", "HYPE", "DOGE", "BNB", "Bitcoin", "Ethereum"]
+# 目标币种清单
+SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "HYPE", "DOGE", "BNB"]
 
-def get_tokens():
-    """提取目标 Token ID 及其对应的市场元数据，严格过滤价格盘"""
-    result = []
-    seen_conditions = set()
-
+def fetch_latest_market_map():
+    """
+    抓取最新的 7 路币种双向 Token ID。
+    返回结构: { 'BTC': { 'upTokenId': '...', 'downTokenId': '...', 'name': '...' } }
+    """
+    mapping = {}
+    
+    # --- 备选/参考库：你提供的固定 Token ID (用于匹配或备份) ---
+    # 下单核心参数：clobTokenIds[0] 是 Up，clobTokenIds[1] 是 Down
     try:
-        # 实盘建议：直接搜索 "Price"，这样能过滤掉大部分非价格干扰项
         params = {
             "active": "true",
             "closed": "false",
@@ -19,75 +23,74 @@ def get_tokens():
             "limit": 50
         }
         resp = requests.get(f"{BASE_GAMMA}/markets", params=params, timeout=10)
-        if resp.status_code != 200:
-            return []
         
-        all_markets = resp.json()
-        
-        for m in all_markets:
-            q_text = m.get("question", "")
-            cond_id = m.get("conditionId")
-            clob_ids = m.get("clobTokenIds", [])
+        if resp.status_code == 200:
+            all_markets = resp.json()
+            # 过滤并按成交量排序
+            valid_markets = [m for m in all_markets if m.get("clobTokenIds") and len(m["clobTokenIds"]) >= 2]
+            valid_markets.sort(key=lambda x: float(x.get("volume", 0)), reverse=True)
 
-            # 1. 基础过滤：必须有 conditionId 和 两个 TokenId
-            if not cond_id or len(clob_ids) < 2:
-                continue
-
-            # 2. 关键词过滤：匹配你定义的 TARGETS
-            is_target = any(t.lower() in q_text.lower() for t in TARGETS)
-            if not is_target:
-                continue
-
-            # 3. 深度过滤：只保留价格涨跌盘，排除掉 GTA、世界杯、空投等
-            # 价格盘通常包含 "above", "below", "price" 等词
-            q_lower = q_text.lower()
-            if not any(k in q_lower for k in ["above", "price", "hit"]):
-                continue
+            for s in SYMBOLS:
+                for m in valid_markets:
+                    q_lower = m.get("question", "").lower()
+                    # 精准匹配币种和价格特征词
+                    if s.lower() in q_lower and any(k in q_lower for k in ["above", "below", "price"]):
+                        # 排除干扰
+                        if any(n in q_lower for n in ["gta", "airdrop", "fifa", "launch"]):
+                            continue
+                        
+                        if s not in mapping:
+                            mapping[s] = {
+                                "upTokenId": m["clobTokenIds"][0],    # 看涨 Token ID
+                                "downTokenId": m["clobTokenIds"][1],  # 看跌 Token ID
+                                "name": m.get("question")
+                            }
+                            break
+                            
+        if mapping:
+            logging.info(f"📡 成功锁定 {len(mapping)} 个活跃市场的 Token ID")
+        else:
+            logging.warning("⚠️ 未能在 Gamma API 找到活跃市场，请检查网络或关键词")
             
-            # 排除掉已知的干扰词
-            if any(n in q_lower for n in ["gta", "airdrop", "fifa", "launch"]):
-                continue
-
-            if cond_id not in seen_conditions:
-                # 构造和你展示的 JSON 一致的结构
-                result.append({
-                    "name": q_text,
-                    "condition_id": cond_id,
-                    "up_token": clob_ids[0],   # Yes / Up
-                    "down_token": clob_ids[1], # No / Down
-                    "volume": float(m.get("volume", 0))
-                })
-                seen_conditions.add(cond_id)
-            
-        # 按成交量排序，确保拿到的是该币种目前最火（最新）的盘口
-        result.sort(key=lambda x: x['volume'], reverse=True)
-        return result
     except Exception as e:
-        logging.error(f"❌ 获取动态市场失败: {e}")
-        return []
-
-def get_market_map():
-    """返回符合你要求的 JSON 映射格式"""
-    tokens_data = get_tokens()
-    mapping = {}
+        logging.error(f"❌ market.py 获取动态 ID 失败: {e}")
     
-    # 定义标准 Symbol 映射，方便 main.py 索引
-    symbols = ["BTC", "ETH", "SOL", "HYPE", "DOGE", "BNB"]
-    
-    for item in tokens_data:
-        for s in symbols:
-            # 只要标题里包含这个币种名，且 mapping 里还没存（因为我们排过序，第一个就是最热的）
-            if s.lower() in item['name'].lower() and s not in mapping:
-                mapping[s] = {
-                    "conditionId": item['condition_id'],
-                    "upTokenId": item['up_token'],
-                    "downTokenId": item['down_token'],
-                    "name": item['name']
-                }
-                break
     return mapping
-    "conditionId": "0x3e04c9857b181113e1fe9f89cb809bcc587f8ff06502c5156f2529b7092eae84",
-    "upTokenId": "88438400974108281071153782653753259556878826837492102662188120562364103801244",
-    "downTokenId": "44276292184228714549958513042732610153778868935733901181917332805027190282661"
-  }
+
+# --- 如果需要手动指定，这里是你提供的 ID 快速索引 (用于 main.py 或测试) ---
+STATIC_IDS = {
+    "BTC": {
+        "up": "68033518322462335017843667442682033117378620344572675041159649454017731343067",
+        "down": "4857959446965795970976860511013818094677564843650044896579455854964354881854"
+    },
+    "ETH": {
+        "up": "69256652064245782780529774986464293775776470783862394043049517906034686817838",
+        "down": "5463917290293294768422587344326048548268618362346459234743933989476551528987"
+    },
+    "SOL": {
+        "up": "69279838525883726555095532302298388729363341281749130469766889916023297995857",
+        "down": "64765597988237464006795534311868785038220787854016227382174572792711823011082"
+    },
+    "XRP": {
+        "up": "104411914481477053534318561802554024712780205781706160410044625323904170812315",
+        "down": "78305837986307999911003841491899832231273386732702850651664192323121509554051"
+    },
+    "HYPE": {
+        "up": "50038771340418993294018272397092069940213741826586333972616522505039311929390",
+        "down": "96937935180550481071812156164606220550297160543323408939052294433375284503029"
+    },
+    "DOGE": {
+        "up": "77246462665187791918411548893693981594268749639354665802735462289608435220396",
+        "down": "53200683549240953177111470267108001228810714120869358213345876103084235397625"
+    },
+    "BNB": {
+        "up": "88438400974108281071153782653753259556878826837492102662188120562364103801244",
+        "down": "44276292184228714549958513042732610153778868935733901181917332805027190282661"
+    }
 }
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    res = fetch_latest_market_map()
+    import json
+    print(json.dumps(res, indent=2, ensure_ascii=False))
