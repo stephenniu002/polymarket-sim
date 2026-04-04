@@ -1,96 +1,413 @@
-import os, asyncio, logging, time, requests, traceback
+import os, asyncio, logging, time, requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, ApiCreds
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.signer import Signer
 
-# --- 1. 基础日志配置 ---
+# ================= 配置 =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# 全局客户端占位
-client = None
+PK = os.getenv("FOX_PRIVATE_KEY")
+FUNDER = os.getenv("Funder")
 
-def init_v17_1():
-    global client
+if not PK or not PK.startswith("0x"):
+    raise Exception("❌ FOX_PRIVATE_KEY 未正确配置")
+
+# ================= 客户端 =================
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    key=PK,
+    chain_id=137,
+    funder=FUNDER
+)
+
+# 🔥 关键修复：强制绑定 signer
+client.signer = Signer(PK, chain_id=137)
+
+# ================= 初始化 =================
+def init():
     try:
-        logging.info("🔧 V17.1 启动：深度属性注入模式...")
-        
-        # --- 变量对齐：严格匹配你的 Railway 截图 ---
-        pk = os.getenv("POLY_PRIVATE_KEY")
-        funder = os.getenv("POLY_ADDRESS")
-        api_key = os.getenv("POLY_API_KEY")
-        api_secret = os.getenv("POLY_SECRET")
-        api_pass = os.getenv("POLY_PASSPHRASE")
+        logging.info("🔧 初始化 API 凭证...")
 
-        # 1. 预检变量是否存在
-        if not all([pk, funder, api_key, api_secret, api_pass]):
-            logging.error("❌ 严重错误：Railway 变量读取不全！")
-            logging.error(f"检查状态: PK:{bool(pk)}, Addr:{bool(funder)}, Key:{bool(api_key)}")
-            return False
-
-        # 2. 实例化客户端
-        # 注意：这里必须传入正确的 chain_id (Polygon 是 137)
-        client = ClobClient(
-            host="https://clob.polymarket.com", 
-            key=pk, 
-            chain_id=137, 
-            funder=funder
-        )
-
-        # 3. 构造并注入 ApiCreds
-        creds = ApiCreds(
-            api_key=api_key, 
-            api_secret=api_secret, 
-            api_passphrase=api_pass
-        )
-        
-        # 强制补全 SDK 内部可能遗失的 signature_type (2 代表常规钱包)
-        creds.signature_type = 2
+        creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
-        
-        # 强制同步内部属性，防止 SDK 内部逻辑因变量名大小写导致 NoneType
-        client.funder = funder
-        client.chain_id = 137
-        
-        # 4. 激活链路
-        logging.info(f"🔗 正在为地址 {funder[:10]}... 激活链路...")
+
         client.update_balance_allowance()
-        
-        logging.info("✅ 链路已激活 (深度注入模式)")
+
+        logging.info("✅ 初始化完成")
         return True
     except Exception as e:
-        logging.error(f"❌ 引擎初始化失败: {e}")
-        logging.error(traceback.format_exc()) # 打印具体的报错行数
+        logging.error(f"❌ 初始化失败: {e}")
         return False
 
-# --- 3. 交易循环 ---
+# ================= 余额 =================
+async def get_balance():
+    try:
+        if hasattr(client, "get_balance"):
+            res = await asyncio.to_thread(client.get_balance)
+            return float(res.get("balance", 0))
+
+        elif hasattr(client, "get_user_balance"):
+            res = await asyncio.to_thread(client.get_user_balance)
+            return float(res.get("balance", 0))
+
+        return -1
+    except Exception as e:
+        logging.error(f"❌ 余额失败: {e}")
+        return -1
+
+# ================= Gamma 市场 =================
+def fetch_markets():
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {"limit": 20, "active": "true"}
+
+    try:
+        res = requests.get(url, params=params, timeout=10).json()
+
+        markets = []
+        for m in res:
+            vol = float(m.get("volume", 0))
+            tokens = m.get("tokens", [])
+
+            if vol > 1000 and len(tokens) >= 2:
+                markets.append({
+                    "name": m["question"],
+                    "token": tokens[0]["token_id"],
+                    "volume": vol
+                })
+
+        markets.sort(key=lambda x: x["volume"], reverse=True)
+        return markets[:5]
+
+    except Exception as e:
+        logging.error(f"❌ Gamma失败: {e}")
+        return []
+
+# ================= 盘口过滤 =================
+def is_tradeable(token):
+    try:
+        ob = client.get_order_book(token)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+
+        if not bids or not asks:
+            return False
+
+        spread = float(asks[0][0]) - float(bids[0][0])
+        return spread < 0.05
+    except:
+        return False
+
+# ================= 安全价格 =================
+def get_price(token):
+    try:
+        ob = client.get_order_book(token)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+
+        if not bids or not asks:
+            return 0.2
+
+        bid = float(bids[0][0])
+        ask = float(asks[0][0])
+
+        return round((bid + ask) / 2, 3)
+    except:
+        return 0.2
+
+# ================= 风控 =================
+trade_history = []
+cooldown_until = 0
+
+def can_trade():
+    global cooldown_until
+
+    if time.time() < cooldown_until:
+        return False
+
+    if len(trade_history) >= 3 and all(x == "LOSE" for x in trade_history[-3:]):
+        cooldown_until = time.time() + 600
+        logging.warning("🛑 连续亏损，暂停10分钟")
+        return False
+
+    return True
+
+# ================= 下单 =================
+async def execute(token, name, balance):
+    try:
+        size = max(0.1, round(balance * 0.1, 2))
+        price = get_price(token)
+
+        order = OrderArgs(
+            price=price,
+            size=size,
+            side="buy",
+            token_id=str(token)
+        )
+
+        def _do():
+            signed = client.create_order(order)
+            return client.post_order(signed, OrderType.GTC)
+
+        res = await asyncio.to_thread(_do)
+
+        if res and res.get("success"):
+            logging.info(f"🎯 成交成功 | {name} | {size}")
+            trade_history.append("WIN")  # 简化先写WIN
+        else:
+            logging.warning(f"❌ 下单失败: {res}")
+            trade_history.append("LOSE")
+
+    except Exception as e:
+        logging.error(f"❌ 下单异常: {e}")
+        trade_history.append("LOSE")
+
+# ================= 主逻辑 =================
+async def step():
+    logging.info("💓 heartbeat")
+
+    if not can_trade():
+        return
+
+    balance = await get_balance()
+    if balance <= 0:
+        logging.warning("💰 余额异常")
+        return
+
+    logging.info(f"💰 余额: {balance}")
+
+    markets = fetch_markets()
+    if not markets:
+        logging.warning("🔎 无市场")
+        return
+
+    for m in markets:
+        if is_tradeable(m["token"]):
+            logging.info(f"🎯 选择市场: {m['name']}")
+            await execute(m["token"], m["name"], balance)
+            return
+
+    logging.warning("⚠️ 无可交易市场")
+
+# ================= 主入口 =================
 async def main():
-    logging.info("🚀 polymarket-sim: V17.1 (全变量对齐版) 启动")
-    
-    # 执行初始化
-    if not init_v17_1():
-        logging.critical("🛑 初始化失败，程序退出。请检查 Railway 环境变量！")
+    logging.info("🚀 V17.1 Railway 实盘启动")
+
+    if not init():
         return
 
     while True:
         try:
-            # 使用 asyncio 运行同步库方法获取余额
-            resp = await asyncio.to_thread(client.get_balance)
-            
-            # 处理不同版本的返回格式
-            if isinstance(resp, dict):
-                balance = float(resp.get("balance", 0))
-            else:
-                balance = float(resp)
-                
-            logging.info(f"💰 实时余额: {balance} USDC.e")
-            
-            # 每 5 分钟轮询一次
+            await step()
             await asyncio.sleep(300)
         except Exception as e:
-            logging.error(f"⚠️ 守护异常: {e}")
-            await asyncio.sleep(10)
+            logging.error(f"💥 崩溃: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
+    asyncio.run(main())import os, asyncio, logging, time, requests
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.signer import Signer
+
+# ================= 配置 =================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+PK = os.getenv("FOX_PRIVATE_KEY")
+FUNDER = os.getenv("Funder")
+
+if not PK or not PK.startswith("0x"):
+    raise Exception("❌ FOX_PRIVATE_KEY 未正确配置")
+
+# ================= 客户端 =================
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    key=PK,
+    chain_id=137,
+    funder=FUNDER
+)
+
+# 🔥 关键修复：强制绑定 signer
+client.signer = Signer(PK, chain_id=137)
+
+# ================= 初始化 =================
+def init():
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("👋 机器人已手动停止")
+        logging.info("🔧 初始化 API 凭证...")
+
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+
+        client.update_balance_allowance()
+
+        logging.info("✅ 初始化完成")
+        return True
+    except Exception as e:
+        logging.error(f"❌ 初始化失败: {e}")
+        return False
+
+# ================= 余额 =================
+async def get_balance():
+    try:
+        if hasattr(client, "get_balance"):
+            res = await asyncio.to_thread(client.get_balance)
+            return float(res.get("balance", 0))
+
+        elif hasattr(client, "get_user_balance"):
+            res = await asyncio.to_thread(client.get_user_balance)
+            return float(res.get("balance", 0))
+
+        return -1
+    except Exception as e:
+        logging.error(f"❌ 余额失败: {e}")
+        return -1
+
+# ================= Gamma 市场 =================
+def fetch_markets():
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {"limit": 20, "active": "true"}
+
+    try:
+        res = requests.get(url, params=params, timeout=10).json()
+
+        markets = []
+        for m in res:
+            vol = float(m.get("volume", 0))
+            tokens = m.get("tokens", [])
+
+            if vol > 1000 and len(tokens) >= 2:
+                markets.append({
+                    "name": m["question"],
+                    "token": tokens[0]["token_id"],
+                    "volume": vol
+                })
+
+        markets.sort(key=lambda x: x["volume"], reverse=True)
+        return markets[:5]
+
+    except Exception as e:
+        logging.error(f"❌ Gamma失败: {e}")
+        return []
+
+# ================= 盘口过滤 =================
+def is_tradeable(token):
+    try:
+        ob = client.get_order_book(token)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+
+        if not bids or not asks:
+            return False
+
+        spread = float(asks[0][0]) - float(bids[0][0])
+        return spread < 0.05
+    except:
+        return False
+
+# ================= 安全价格 =================
+def get_price(token):
+    try:
+        ob = client.get_order_book(token)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+
+        if not bids or not asks:
+            return 0.2
+
+        bid = float(bids[0][0])
+        ask = float(asks[0][0])
+
+        return round((bid + ask) / 2, 3)
+    except:
+        return 0.2
+
+# ================= 风控 =================
+trade_history = []
+cooldown_until = 0
+
+def can_trade():
+    global cooldown_until
+
+    if time.time() < cooldown_until:
+        return False
+
+    if len(trade_history) >= 3 and all(x == "LOSE" for x in trade_history[-3:]):
+        cooldown_until = time.time() + 600
+        logging.warning("🛑 连续亏损，暂停10分钟")
+        return False
+
+    return True
+
+# ================= 下单 =================
+async def execute(token, name, balance):
+    try:
+        size = max(0.1, round(balance * 0.1, 2))
+        price = get_price(token)
+
+        order = OrderArgs(
+            price=price,
+            size=size,
+            side="buy",
+            token_id=str(token)
+        )
+
+        def _do():
+            signed = client.create_order(order)
+            return client.post_order(signed, OrderType.GTC)
+
+        res = await asyncio.to_thread(_do)
+
+        if res and res.get("success"):
+            logging.info(f"🎯 成交成功 | {name} | {size}")
+            trade_history.append("WIN")  # 简化先写WIN
+        else:
+            logging.warning(f"❌ 下单失败: {res}")
+            trade_history.append("LOSE")
+
+    except Exception as e:
+        logging.error(f"❌ 下单异常: {e}")
+        trade_history.append("LOSE")
+
+# ================= 主逻辑 =================
+async def step():
+    logging.info("💓 heartbeat")
+
+    if not can_trade():
+        return
+
+    balance = await get_balance()
+    if balance <= 0:
+        logging.warning("💰 余额异常")
+        return
+
+    logging.info(f"💰 余额: {balance}")
+
+    markets = fetch_markets()
+    if not markets:
+        logging.warning("🔎 无市场")
+        return
+
+    for m in markets:
+        if is_tradeable(m["token"]):
+            logging.info(f"🎯 选择市场: {m['name']}")
+            await execute(m["token"], m["name"], balance)
+            return
+
+    logging.warning("⚠️ 无可交易市场")
+
+# ================= 主入口 =================
+async def main():
+    logging.info("🚀 V17.1 Railway 实盘启动")
+
+    if not init():
+        return
+
+    while True:
+        try:
+            await step()
+            await asyncio.sleep(300)
+        except Exception as e:
+            logging.error(f"💥 崩溃: {e}")
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())
