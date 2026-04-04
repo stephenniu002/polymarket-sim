@@ -4,31 +4,40 @@ import logging
 import requests
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
-from tg import send_message # 确保 tg.py 还在
+from py_clob_client.clob_types import ApiCreds # 👈 导入凭证类
+from tg import send_message
 
-# 1. 基础配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-SIGNATURE_TYPE_PROXY = 2 # 代理钱包模式
 
-# 2. 实例化客户端 (适配 0.34.6)
 def get_polymarket_client():
+    # 1. 基础初始化
     client = ClobClient(
         host="https://clob.polymarket.com",
         key=os.getenv("POLY_PRIVATE_KEY"),
         chain_id=POLYGON,
-        signature_type=SIGNATURE_TYPE_PROXY,
+        signature_type=2, # 直接用数字 2，最稳
         funder=os.getenv("POLY_ADDRESS")
     )
-    client.set_api_creds(
+    
+    # 2. 构造凭证对象并设置
+    # 这个版本可能只接受这种显式的 ApiCreds 对象
+    creds = ApiCreds(
         api_key=os.getenv("POLY_API_KEY"),
         api_secret=os.getenv("POLY_SECRET"),
         api_passphrase=os.getenv("POLY_PASSPHRASE")
     )
+    client.set_api_creds(creds) # 👈 直接传对象，不传关键字参数
+    
     return client
 
-client = get_polymarket_client()
+# 尝试启动客户端
+try:
+    client = get_polymarket_client()
+except Exception as e:
+    logging.error(f"❌ 客户端启动失败，尝试备选方案: {e}")
+    # 如果上面还报错，说明版本要求更简单
+    client = ClobClient("https://clob.polymarket.com", POLYGON, os.getenv("POLY_PRIVATE_KEY"))
 
-# 3. 动态扫描函数 (解决 5 分钟 ID 变化)
 def get_live_target(asset="Bitcoin"):
     url = "https://gamma-api.polymarket.com/markets"
     params = {"active": "true", "closed": "false", "search": f"{asset} Price", "limit": 5}
@@ -38,49 +47,39 @@ def get_live_target(asset="Bitcoin"):
         if valid:
             m = max(valid, key=lambda x: float(x.get("volume", 0)))
             return {"q": m.get("question"), "tid": m.get("clobTokenIds")[0]}
-    except:
-        return None
+    except: return None
     return None
 
-# 4. 下单函数
-def place_lobster_order(token_id, price=0.5, size=1.0):
-    try:
-        order_args = client.create_order(price=float(price), size=float(size), side="buy", token_id=str(token_id))
-        signed = client.sign_order(order_args)
-        return client.place_order(signed)
-    except Exception as e:
-        logging.error(f"❌ 交易异常: {e}")
-        return None
-
-# 5. 主循环
-def lobster_fire_control_v4():
-    logging.info("🚀 龙虾火控系统 V4.1 (单文件实盘版) 启动")
-    send_message("🦞 龙虾火控系统 V4.1 已上线！\n监测账户余额中...")
+def lobster_fire_control_v4_2():
+    logging.info("🚀 龙虾火控系统 V4.2 (环境适配版) 启动")
+    send_message("🦞 龙虾火控系统 V4.2 已上线！")
 
     while True:
         try:
-            # 检查余额 (0x365B...)
+            # 这里的余额查询是关键
             resp = client.get_collateral_balance(os.getenv("POLY_ADDRESS"))
             balance = round(float(resp.get("balance", 0)), 2)
-            logging.info(f"💰 账户余额: {balance} USDC")
+            logging.info(f"💰 实盘余额: {balance} USDC")
 
             if balance < 1.0:
-                logging.warning("⚠️ 余额不足，挂机中...")
+                logging.warning("⚠️ 余额不足，系统待机中...")
                 time.sleep(60)
                 continue
 
-            # 扫描核心资产
             for asset in ["Bitcoin", "Ethereum", "Solana"]:
                 target = get_live_target(asset)
                 if target:
-                    logging.info(f"📡 监测中: {target['q']}")
-                    # 测试下单逻辑 (去掉注释即可开火)
-                    # place_lobster_order(target['tid'], price=0.5, size=1.0)
+                    logging.info(f"📡 监控目标: {target['q']}")
 
-            logging.info("✅ 轮询完成，5分钟后同步新 ConditionID")
+            logging.info("✅ 本轮巡检完成。")
             time.sleep(300)
 
         except Exception as e:
+            logging.error(f"⚠️ 运行异常: {e}")
+            time.sleep(10)
+
+if __name__ == "__main__":
+    lobster_fire_control_v4_2()
             logging.error(f"主程序故障: {e}")
             time.sleep(10)
 
