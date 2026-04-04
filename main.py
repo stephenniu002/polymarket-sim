@@ -1,38 +1,54 @@
-async def main():
+async def get_balance():
+    """
+    终极兼容版：自动探测 SDK 余额接口并解析多种返回格式
+    """
     try:
-        logging.info("🚀 龙虾 V8.2 实盘系统启动中...")
-        
-        # 1. 先验证环境变量
-        if not SIGNER_PK or "0x" not in SIGNER_PK:
-            raise ValueError("私钥格式不正确或未读取到")
+        def _get():
+            # 1. 探测 SDK 支持哪种方法名
+            method_name = None
+            for m in ["get_collateral_balance", "get_balance", "get_user_balance"]:
+                if hasattr(client, m):
+                    method_name = m
+                    break
             
-        # 2. 预抓取一次市场 ID (调用你的 market.py 函数)
-        global ACTIVE_MARKETS
-        ACTIVE_MARKETS = fetch_latest_market_map()
-        
-        if not ACTIVE_MARKETS:
-            logging.warning("⚠️ 初始启动未发现活跃市场，程序将持续尝试...")
+            if not method_name:
+                raise Exception("SDK 不支持任何已知的余额接口")
 
-        # 3. 进入主循环
-        while True:
+            func = getattr(client, method_name)
+            
+            # 2. 尝试不同的调用方式 (有些版本必须传地址，有些不用)
             try:
-                # 你的信号扫描逻辑...
-                balance = await get_balance()
-                logging.info(f"--- 循环检查中 (余额: {balance}) ---")
-                await asyncio.sleep(30)
-            except Exception as loop_e:
-                logging.error(f"⚠️ 循环内报错 (不退出): {loop_e}")
-                await asyncio.sleep(10)
+                # 优先尝试传参调用 (Funder 模式常用)
+                return func(FUNDER)
+            except TypeError:
+                # 如果报错参数过多，则尝试不带参数调用
+                return func()
 
-    except Exception as fatal_e:
-        logging.error(f"❌ 致命启动错误: {fatal_e}")
-        # 发送 TG 报警告诉你为什么挂了
-        send_tg(f"🚨 系统启动失败并退出: {fatal_e}")
-        # 停顿一下，防止 Railway 无限重启导致封号
-        await asyncio.sleep(60)
+        # 在线程池中执行同步 SDK 方法，防止阻塞协程
+        resp = await asyncio.to_thread(_get)
 
-if __name__ == "__main__":
-    try:
+        # DEBUG 日志，帮助你在 Railway 后台看到原始数据结构
+        logging.debug(f"🔍 余额接口原始返回: {resp}")
+
+        # 3. 通用解析逻辑：适配字典返回或直接数值返回
+        balance = 0.0
+        if isinstance(resp, dict):
+            # 尝试所有可能的 key: balance, collateral_balance, available
+            val = resp.get("balance") or resp.get("collateral_balance") or resp.get("available") or 0
+            balance = float(val)
+        elif isinstance(resp, (int, float, str)):
+            balance = float(resp)
+        else:
+            # 如果返回的是特殊对象，尝试读取属性
+            balance = float(getattr(resp, "balance", 0))
+
+        logging.info(f"💰 账户可用余额: {balance} USDC")
+        return balance
+
+    except Exception as e:
+        logging.error(f"❌ 余额读取失败: {e}")
+        return 0.0
+
         asyncio.run(main())
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
