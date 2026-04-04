@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logging.info("🚀 polymarket-sim: V17.1 (全变量对齐版) 启动")
 
 # ================= 环境变量 =================
-PK = os.getenv("FOX_PRIVATE_KEY")
+PK = os.getenv("PRIVATE_KEY")
 FUNDER = os.getenv("Funder")
 
 if not PK or not PK.startswith("0x"):
