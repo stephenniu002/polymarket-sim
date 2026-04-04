@@ -6,7 +6,7 @@ import requests
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from market import fetch_latest_market_map
+from market import fetch_latest_market_map # 确保根目录有此文件
 
 # --- 1. 基础配置与 TG 播报 ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -18,7 +18,7 @@ def send_tg(msg):
     if TG_TOKEN and TG_CHAT_ID:
         try:
             requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", 
-                          data={"chat_id": TG_CHAT_ID, "text": f"🦞 龙虾 V14 实盘:\n{msg}"}, timeout=5)
+                          data={"chat_id": TG_CHAT_ID, "text": f"🦞 龙虾 V15 实盘:\n{msg}"}, timeout=5)
         except Exception as e:
             logging.error(f"TG 发送失败: {e}")
 
@@ -71,9 +71,7 @@ async def execute_trade(token_id, title, price=0.2):
 
         def _do_post():
             # 💡 核心修复：新版 SDK 下，create_order 内部已包含自动签名
-            # signed_order 现在直接传递给 post_order
             signed_order = client.create_order(order_args)
-            
             # 💡 核心修复：用 post_order 并指定订单类型 (GTC: 永久有效直至成交)
             return client.post_order(signed_order, OrderType.GTC)
 
@@ -91,14 +89,11 @@ async def execute_trade(token_id, title, price=0.2):
     except Exception as e:
         err_str = str(e)
         logging.error(f"❌ 下单逻辑崩溃: {err_str}")
-        # 如果是因为版本方法名问题，这里会捕捉到
-        if "attribute" in err_str.lower():
-            send_tg("⚠️ 检测到 SDK 方法名不匹配，请检查 client.orders 路径")
         return False
 
 # --- 5. 主程序逻辑 ---
 async def main():
-    logging.info("🚀 龙虾 V14 实盘引擎就绪")
+    logging.info("🚀 龙虾 V15 实盘引擎就绪")
     send_tg("系统启动：正在进行 7 路币种捡漏扫描...")
     
     last_report_time = time.time()
@@ -109,7 +104,7 @@ async def main():
             balance = await get_balance_safe()
             logging.info(f"💰 当前账户余额: {balance} USDC.e")
 
-            if balance < 0.2:
+            if balance < 0.1: # 降低门槛，方便测试
                 logging.warning("🛑 余额不足，等待充值或结算中...")
                 await asyncio.sleep(60)
                 continue
@@ -131,7 +126,7 @@ async def main():
                 # 执行下单
                 await execute_trade(token_id, title)
                 
-                # 频率控制：每单之间停顿一下，防止被 API 封锁
+                # 频率控制：每单之间停顿一下
                 await asyncio.sleep(2)
 
             # 4. 每 15 分钟报一次平安
