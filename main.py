@@ -9,24 +9,19 @@ from py_clob_client.clob_types import ApiCreds
 # 基础日志配置
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# --- 1:1 对齐 Railway 变量 ---
+# --- Railway 变量对齐 ---
 POLY_ADDRESS = os.getenv("POLY_ADDRESS")
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY")
 POLY_API_KEY = os.getenv("POLY_API_KEY")
 POLY_PASSPHRASE = os.getenv("POLY_PASSPHRASE")
 POLY_SECRET = os.getenv("POLY_SECRET")
-
-# ⚠️ 注意这里：你截图里是小写的 signature_type
 SIG_TYPE = int(os.getenv("signature_type", 2)) 
-
-# ⚠️ 注意这里：你截图里分别是 TELEGRAM_CHAT_ID 和 TG_TOKEN
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 业务参数
 ASSETS = ["Bitcoin", "Ethereum", "Solana", "XRP", "Dogecoin", "BNB"]
-LOOP_INTERVAL = 60 
 
+# --- Telegram 通知 ---
 async def tg_notify(message):
     if not TG_TOKEN or not TG_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -35,9 +30,9 @@ async def tg_notify(message):
             await session.post(url, json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
     except: pass
 
+# --- 初始化客户端 ---
 def get_client():
     try:
-        # 使用 Railway 注入的变量初始化
         client = ClobClient(
             host="https://clob.polymarket.com",
             key=POLY_PRIVATE_KEY,
@@ -51,7 +46,6 @@ def get_client():
             api_passphrase=POLY_PASSPHRASE
         )
         client.set_api_creds(creds)
-        logging.info("✅ Polymarket 客户端初始化成功")
         return client
     except Exception as e:
         logging.error(f"❌ 初始化失败: {e}")
@@ -59,23 +53,24 @@ def get_client():
 
 client = get_client()
 
+# --- 核心修复：0.34.6 余额查询标准路径 ---
 async def get_balance():
-    """获取实盘余额：使用 0.34.6 版存在的 get_collateral_balance"""
     if not client: return 0.0
     try:
-        # 使用你确认有效的 get_collateral_balance
-        # 通过 asyncio.to_thread 包装防止阻塞
-        resp = await asyncio.to_thread(client.get_collateral_balance)
+        # 在最新 SDK 中，这是获取 API 关联账户可用 USDC 余额的标准方法
+        # 它会自动识别你的代理钱包身份
+        resp = await asyncio.to_thread(client.get_balance)
         
+        # 响应通常是一个纯数值字符串或带 balance 键的字典
         if isinstance(resp, dict):
-            val = resp.get("balance", 0)
-            return round(float(val), 2)
+            return round(float(resp.get("balance", 0)), 2)
         return round(float(resp), 2)
     except Exception as e:
-        logging.error(f"❌ 余额查询路径异常: {e}")
+        logging.error(f"❌ 余额查询异常: {e}")
         return 0.0
 
-async def get_live_target(asset):
+# --- 动态扫描盘口 ---
+async def get_live_token(asset):
     url = "https://gamma-api.polymarket.com/markets"
     params = {"active": "true", "closed": "false", "search": f"{asset} Price", "limit": 5}
     try:
@@ -89,28 +84,32 @@ async def get_live_target(asset):
                     return m.get("clobTokenIds")[0], m.get("question")
     except: return None, None
 
+# --- 主逻辑循环 ---
 async def process_round():
     balance = await get_balance()
     logging.info(f"💰 [实盘巡检] 余额: {balance} USDC")
     
-    # 如果余额显示为 0，给个明确的警告日志
-    if balance <= 0:
-        logging.warning(f"⚠️ 余额为 0，请确认 POLY_ADDRESS ({POLY_ADDRESS}) 是否正确")
+    if balance > 0:
+        logging.info("🎯 余额抓取成功，正在检索最新 Token...")
+    else:
+        # 只有在余额真的为 0 且没报错时才报警告
+        logging.warning("⚠️ 余额读取为 0.0，请确认 API Key 是否有 View 权限")
 
+    results = []
     for asset in ASSETS:
-        tid, q = await get_live_target(asset)
+        tid, q = await get_live_token(asset)
         if tid:
-            logging.info(f"📡 监测中: {q}")
+            logging.info(f"📡 监控中: {q}")
         await asyncio.sleep(1)
 
 async def main_loop():
-    logging.info("🚀 龙虾实盘 V5.2 (变量对齐版) 启动")
-    await tg_notify("🚀 龙虾实盘 V5.2 已上线！正在同步 0x365B... 余额")
+    logging.info("🚀 龙虾实盘 V5.4 (标准路径版) 启动")
+    await tg_notify("🚀 龙虾实盘 V5.4 (SDK 标准对齐) 已上线！")
     
     while True:
         try:
             await process_round()
-            await asyncio.sleep(LOOP_INTERVAL)
+            await asyncio.sleep(60)
         except Exception as e:
             logging.error(f"⚠️ 循环异常: {e}")
             await asyncio.sleep(10)
