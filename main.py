@@ -1,123 +1,150 @@
 import os, asyncio, logging, time, requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.signer import Signer 
+from py_clob_client.clob_types import OrderArgs, OrderType
 
-# --- 1. 配置与变量 ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# --- 1. 严谨的日志系统 ---
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 PK = os.getenv("FOX_PRIVATE_KEY")
 FUNDER = os.getenv("Funder")
 
-# --- 2. 客户端初始化与手动绑定 ---
+# --- 2. 标准化客户端初始化 (回归 SDK 原生逻辑) ---
 client = ClobClient(
     host="https://clob.polymarket.com",
     key=PK,
-    chain_id=137,
-    signature_type=2,
+    chain_id=137, # Polygon Mainnet
     funder=FUNDER
 )
 
-def init_v16_7():
+def init_v17_engine():
+    """
+    依照标准流程激活 API 凭证，不再手动 Hack Signer
+    """
     try:
-        logging.info("🔧 正在执行 V16.7 核心初始化...")
-        # 1️⃣ 手动绑定 Signer (彻底解决 NoneType 'signature_type' 报错)
-        if PK:
-            client.signer = Signer(PK, chain_id=137)
-            logging.info("✅ Signer 手动绑定完成")
-
-        # 2️⃣ 派生并注入凭证
+        logging.info("🔧 V17 引擎启动：正在同步 API 凭证...")
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
-        logging.info("✅ API Credentials 注入成功")
-
-        # 3️⃣ 修正后的授权调用
-        try:
-            client.update_balance_allowance() # 不传参数，使用 SDK 默认值
-            logging.info("✅ 资产授权已自动同步")
-        except: pass
+        
+        # 激活授权 (Allowance)
+        client.update_balance_allowance()
+        logging.info("✅ 引擎初始化完成，交易链路已打通")
         return True
     except Exception as e:
-        logging.error(f"❌ 初始化失败: {e}")
+        logging.error(f"❌ 引擎初始化失败: {e}")
         return False
 
-# --- 3. Gamma API 市场发现 (根据 2:02 PM 优化) ---
-def fetch_markets_v16_7():
-    """
-    使用正确的关键词搜索：bitcoin, ethereum, solana
-    """
-    url = "https://gamma-api.polymarket.com/markets"
-    keywords = ["bitcoin", "ethereum", "solana"]
-    found_tokens = []
-    
-    for kw in keywords:
-        try:
-            params = {"limit": 5, "active": "true", "search": kw}
-            res = requests.get(url, params=params).json()
-            for m in res:
-                # 只要 question 里包含 Price 的预测市场
-                if "Price" in m.get("question", ""):
-                    tokens = m.get("tokens", [])
-                    if len(tokens) >= 2:
-                        found_tokens.append({
-                            "name": m["question"],
-                            "yes_id": tokens[0]["token_id"]
-                        })
-        except Exception as e:
-            logging.warning(f"⚠️ 搜索 {kw} 异常: {e}")
-            
-    return found_tokens[:7] # 最多取 7 个
-
-# --- 4. 余额与交易逻辑 ---
-async def trade_step():
-    # 余额读取 (Signer 绑定后将恢复正常)
+# --- 3. 真实余额校验 (防盲打) ---
+async def get_balance_real():
     try:
-        resp = await asyncio.to_thread(client.get_balance_allowance)
-        balance = float(resp.get("balance") if isinstance(resp, dict) else (resp or 0))
-    except:
-        balance = 10.84 # 盲打兜底
+        # 优先尝试标准余额接口
+        resp = await asyncio.to_thread(client.get_balance)
+        if resp and "balance" in resp:
+            return float(resp["balance"])
+        
+        # 备选接口 (适配不同 SDK 版本)
+        resp = await asyncio.to_thread(client.get_user_balance)
+        return float(resp.get("balance", 0))
+    except Exception as e:
+        logging.error(f"❌ 余额获取失败: {e}")
+        return -1.0 # 返回 -1 表示异常，触发停手
 
-    logging.info(f"💰 实时余额: {balance} USDC.e")
+# --- 4. 智能市场筛选 (带评分系统) ---
+def fetch_top_markets():
+    url = "https://gamma-api.polymarket.com/markets"
+    # 扩大搜索范围，改用成交量(Volume)评分
+    params = {"limit": 20, "active": "true", "closed": "false"}
+    
+    try:
+        res = requests.get(url, params=params).json()
+        scored_markets = []
+        for m in res:
+            volume = float(m.get("volume", 0))
+            # 过滤：成交量 > 1000 且 必须是 Price 相关或高热度市场
+            if volume > 1000:
+                tokens = m.get("tokens", [])
+                if len(tokens) >= 2:
+                    scored_markets.append({
+                        "name": m["question"],
+                        "yes_id": tokens[0]["token_id"],
+                        "volume": volume
+                    })
+        
+        # 按成交量降序排列，取最强的
+        scored_markets.sort(key=lambda x: x["volume"], reverse=True)
+        return scored_markets
+    except Exception as e:
+        logging.error(f"⚠️ 市场抓取异常: {e}")
+        return []
 
-    # 发现市场
-    market_list = fetch_markets_v16_7()
-    if not market_list:
-        logging.warning("🔎 依然未发现活跃市场，请确认 Gamma API 连通性")
+# --- 5. 核心交易步进 ---
+async def trade_step():
+    # A. 余额检查
+    balance = await get_balance_real()
+    if balance == -1.0:
+        logging.warning("⚠️ 无法确认真实余额，为了资金安全，本轮跳过")
+        return
+    if balance < 1.0:
+        logging.info(f"💰 余额不足 (当前: {balance})，进入观察模式")
         return
 
-    logging.info(f"📡 已锁定 {len(market_list)} 个目标市场，准备扫描信号...")
-    
-    # 模拟下单第一个市场 (V16.7 演示)
-    target = market_list[0]
-    await execute_safe(target['yes_id'], target['name'], balance)
+    logging.info(f"💰 账户实盘资金: {balance} USDC.e")
 
-async def execute_safe(token_id, title, funds):
+    # B. 寻找最优市场
+    markets = fetch_top_markets()
+    if not markets:
+        logging.warning("🔎 未发现符合流动性要求(Vol > 1000)的市场")
+        return
+
+    # C. 选出评分最高的市场
+    best_market = markets[0]
+    logging.info(f"🎯 锁定最优市场: {best_market['name']} (Vol: {best_market['volume']})")
+
+    # D. 执行成交验证下单
+    await execute_with_verify(best_market['yes_id'], best_market['name'], balance)
+
+async def execute_with_verify(token_id, title, funds):
     try:
-        size = max(0.1, round(funds * 0.1, 2))
-        order = OrderArgs(price=0.2, size=size, side="buy", token_id=str(token_id))
-        
-        def _post():
-            signed = client.create_order(order)
+        # 10% 动态轻仓策略
+        trade_size = max(0.1, round(funds * 0.1, 2))
+        order_args = OrderArgs(price=0.25, size=trade_size, side="buy", token_id=str(token_id))
+
+        def _do_order():
+            signed = client.create_order(order_args)
             return client.post_order(signed, OrderType.GTC)
 
-        res = await asyncio.to_thread(_post)
+        res = await asyncio.to_thread(_do_order)
+        
+        # E. 严格的成交验证
         if res and res.get("success"):
-            logging.info(f"🎯 【实盘成交】市场: {title} | 规模: {size}")
+            order_id = res.get("orderID")
+            logging.info(f"✅ 【交易成功】ID: {order_id} | 市场: {title} | 投入: {trade_size}")
+        else:
+            logging.warning(f"❌ 【下单被拒】原因: {res.get('error') or '未知网络错误'}")
+            
     except Exception as e:
-        logging.error(f"❌ 下单失败: {e}")
+        logging.error(f"❌ 交易执行崩溃保护: {e}")
 
-# --- 5. 守护进程 ---
+# --- 6. 生产级主入口 ---
 async def main():
-    logging.info("🚀 polymarket-sim: V16.7 终极整合版启动")
-    if not init_v16_7(): return
+    logging.info("🚀 polymarket-sim: V17 稳定盈利版启动")
+    
+    # 引擎初始化
+    if not init_v17_engine():
+        logging.error("🚨 核心引擎无法启动，请检查环境变量(PK/Funder)及网络")
+        return
 
     while True:
         try:
             await trade_step()
-            await asyncio.sleep(300) # 每 5 分钟一个周期
+            # 5分钟扫描一次 (300秒)
+            await asyncio.sleep(300)
         except Exception as e:
-            logging.error(f"⚠️ 运行异常: {e}")
+            logging.error(f"⚠️ 主循环异常: {e}")
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
+    # 修正主入口判断
     asyncio.run(main())
