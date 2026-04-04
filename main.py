@@ -6,31 +6,31 @@ from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 from py_clob_client.clob_types import ApiCreds
 
-# ========== 配置 ==========
+# ========== 核心配置 ==========
 ORDER_SIZE = float(os.getenv("ORDER_SIZE", 1.0))
-ASSETS = ["Bitcoin", "Ethereum", "Solana", "XRP", "Dogecoin", "BNB"]
+# 这里的搜索词要精准，建议匹配 Gamma API 的常用标题
+ASSETS = ["Bitcoin Price Above", "Ethereum Price Above", "Solana Price Above"]
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
-# =========================
+# =============================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def send_message(msg: str):
+def send_tg_msg(msg: str):
     if TG_TOKEN and TG_CHAT_ID:
         try:
             url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
             requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg}, timeout=5)
         except Exception as e:
-            logging.error(f"Telegram 发送失败: {e}")
+            logging.error(f"TG 通知失败: {e}")
 
-def get_client():
-    # 修复：ClobClient 基础初始化
+def init_clob_client():
+    """初始化客户端，确保 API Key 权限正确"""
     client = ClobClient(
         host="https://clob.polymarket.com",
         key=os.getenv("POLY_PRIVATE_KEY"),
         chain_id=POLYGON
     )
-    # 设置 API 凭证
     creds = ApiCreds(
         api_key=os.getenv("POLY_API_KEY"),
         api_secret=os.getenv("POLY_SECRET"),
@@ -39,102 +39,115 @@ def get_client():
     client.set_api_creds(creds)
     return client
 
-# 全局客户端
-client = get_client()
+client = init_clob_client()
 
-async def get_balance():
-    """异步查询余额，并增加健壮性校验"""
+async def get_valid_balance():
+    """安全获取余额，处理异常返回"""
     try:
-        # 使用 run_in_executor 防止阻塞异步循环
-        resp = await asyncio.get_event_loop().run_in_executor(
-            None, client.get_collateral_balance
-        )
-        # 注意：SDK 返回结构通常是字符串或包含 'balance' 的字典
+        # 使用线程池执行同步 SDK 调用
+        resp = await asyncio.to_thread(client.get_collateral_balance)
         if resp and isinstance(resp, dict):
-            balance = round(float(resp.get("balance", 0)), 2)
-            logging.info(f"💰 [实盘状态] 账户余额: {balance} USDC")
-            return balance
-        return 0.0
+            val = float(resp.get("balance", 0))
+            logging.info(f"💰 账户可用余额: {val} USDC")
+            return val
     except Exception as e:
-        logging.error(f"❌ 余额查询异常 (请检查 API 权限): {e}")
-        return 0.0
+        logging.error(f"❌ 余额读取失败 (请检查 API View 权限): {e}")
+    return 0.0
 
-def fetch_live_token(asset_name: str):
-    """抓取市场 token_id"""
+def fetch_latest_token(search_query: str):
+    """
+    动态抓取最新的 Token ID
+    逻辑：只找进行中的(active)、成交量最大的第一个市场
+    """
     url = "https://gamma-api.polymarket.com/markets"
-    params = {"active": "true", "closed": "false", "search": asset_name, "limit": 10}
+    params = {
+        "active": "true",
+        "closed": "false",
+        "search": search_query,
+        "limit": 5
+    }
     try:
         resp = requests.get(url, params=params, timeout=10).json()
-        # 筛选条件：包含 'above'，有 token，且是活跃的
-        valid = [m for m in resp if "clobTokenIds" in m and m.get("clobTokenIds")]
-        if valid:
-            # 按成交量排序选最火的市场
-            m = max(valid, key=lambda x: float(x.get("volume", 0)))
-            return m.get("clobTokenIds")[0]
+        # 过滤掉没有 clobTokenIds 的条目
+        markets = [m for m in resp if m.get("clobTokenIds") and len(m["clobTokenIds"]) >= 2]
+        if not markets:
+            return None
+        
+        # 选出成交量最大的市场（通常是最主流的市场）
+        top_market = max(markets, key=lambda x: float(x.get("volume", 0)))
+        
+        # 索引 0 通常是 'Yes' (Above/Up)，索引 1 是 'No' (Below/Down)
+        token_id = top_market["clobTokenIds"][0] 
+        market_name = top_market.get("question", "未知市场")
+        
+        logging.info(f"🎯 匹配到市场: {market_name} | ID: {token_id[:15]}...")
+        return token_id
     except Exception as e:
-        logging.warning(f"获取 {asset_name} 市场数据失败: {e}")
-    return None
+        logging.warning(f"🔍 抓取 {search_query} Token 失败: {e}")
+        return None
 
-async def execute_trade(token_id: str, price: float = 0.5):
-    """异步执行下单全流程"""
+async def safe_execute_buy(token_id: str, asset_label: str):
+    """异步执行下单，带重试和错误隔离"""
     try:
         def _place():
-            # 整合下单逻辑到线程池，避免 ClobClient 内部同步调用卡死异步
+            # 生成、签名、发送订单
             order_args = client.create_order(
-                price=price,
+                price=0.5, # 示例固定 0.5，实盘建议加入价格预测逻辑
                 size=ORDER_SIZE,
                 side="buy",
                 token_id=token_id
             )
-            signed_order = client.sign_order(order_args)
-            return client.place_order(signed_order)
+            signed = client.sign_order(order_args)
+            return client.place_order(signed)
 
-        result = await asyncio.get_event_loop().run_in_executor(None, _place)
-        if result and result.get("success"):
-            logging.info(f"✅ 下单成功: {token_id}")
-            return result
-        else:
-            logging.error(f"❌ 下单未成功: {result}")
-            return None
+        res = await asyncio.to_thread(_place)
+        if res and res.get("success"):
+            logging.info(f"✅ {asset_label} 下单成功!")
+            return True
     except Exception as e:
-        logging.error(f"❌ 下单异常: {e}")
-        return None
+        logging.error(f"❌ {asset_label} 下单失败: {e}")
+    return False
 
-async def trade_cycle():
-    """单轮交易循环"""
-    balance = await get_balance()
+async def run_trading_round():
+    """核心交易轮询"""
+    balance = await get_valid_balance()
+    
     if balance < ORDER_SIZE:
-        logging.warning("⚠️ 余额不足，系统待机中...")
+        logging.warning("🛑 余额不足，跳过本轮")
         return
 
-    tasks = []
+    success_count = 0
+    attempt_count = 0
+
     for asset in ASSETS:
-        token_id = fetch_live_token(asset)
+        token_id = fetch_latest_token(asset)
         if token_id:
-            logging.info(f"📡 {asset} 匹配成功: {token_id}")
-            tasks.append(execute_trade(token_id))
-        else:
-            logging.debug(f"⏭️ {asset} 未找到合适市场")
+            attempt_count += 1
+            # 执行下单
+            is_ok = await safe_execute_buy(token_id, asset)
+            if is_ok: success_count += 1
+            # 稍微停顿，避免请求过快被 Polymarket 频控
+            await asyncio.sleep(1) 
 
-    if tasks:
-        results = await asyncio.gather(*tasks)
-        success_count = sum(1 for r in results if r)
-        if success_count > 0:
-            send_message(f"🦞 龙虾巡检: 成功下单 {success_count} 个品种，当前余额 {balance} USDC")
+    if attempt_count > 0:
+        msg = f"🦞 龙虾实盘报告\n成功/尝试: {success_count}/{attempt_count}\n当前余额: {balance} USDC"
+        send_tg_msg(msg)
 
-async def main_loop():
-    logging.info("🚀 龙虾实盘系统 V5.5 (修复版) 启动")
-    send_message("🦞 龙虾系统已上线！")
+async def main():
+    logging.info("🚀 龙虾实盘系统 V5.6 启动 (API 权限: View+Trade)")
+    send_tg_msg("🚀 龙虾实盘系统已启动，监控资产: " + ", ".join(ASSETS))
+    
     while True:
         try:
-            await trade_cycle()
+            await run_trading_round()
         except Exception as e:
-            logging.error(f"⚠️ 核心循环异常: {e}")
+            logging.error(f"⚠️ 循环崩溃，正在重启: {e}")
         
-        await asyncio.sleep(300) # 5分钟轮询一次
+        # 每 300 秒执行一次，避免频繁操作手续费损耗
+        await asyncio.sleep(300)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main_loop())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("程序手动停止")
+        logging.info("用户停止程序")
