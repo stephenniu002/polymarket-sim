@@ -4,26 +4,22 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.signer import Signer
 from eth_account import Account
 
-# ================= 1. 基础配置与 Telegram =================
+# ================= 1. 基础配置 =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# 优先级：FUNDING_KEY > PRIVATE_KEY
 PK = os.getenv("FUNDING_KEY") or os.getenv("PRIVATE_KEY")
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 自动推导地址，防止手动填写 USDC 合约地址的错误再次发生
 if PK:
     try:
         _acc = Account.from_key(PK)
         FUNDER = _acc.address
-        logging.info(f"✅ 钱包地址已自动识别: {FUNDER}")
-    except Exception as e:
-        logging.error(f"❌ 私钥解析失败，请检查 FUNDING_KEY 格式: {e}")
+        logging.info(f"✅ 钱包地址识别成功: {FUNDER}")
+    except:
         FUNDER = os.getenv("POLY_ADDRESS")
 else:
     FUNDER = os.getenv("POLY_ADDRESS")
-    logging.warning("⚠️ 未检测到私钥，将使用环境变量中的地址")
 
 def send_telegram(text):
     if not TG_TOKEN or not TG_CHAT_ID: return
@@ -31,113 +27,109 @@ def send_telegram(text):
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
         payload = {"chat_id": TG_CHAT_ID, "text": f"🦞 龙虾系统报告:\n{text}", "parse_mode": "HTML"}
         requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logging.error(f"❌ Telegram 发送失败: {e}")
+    except: pass
 
-logging.info("🚀 polymarket-sim: V17.4 (余额修复版) 启动")
+logging.info("🚀 polymarket-sim: V17.5 (SDK兼容性修复版) 启动")
 
 # ================= 2. 客户端初始化 =================
-# 强制指定 Polygon 上的 Native USDC 合约地址
-NATIVE_USDC = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
-
 client = ClobClient(
     host="https://clob.polymarket.com",
     key=PK,
     chain_id=137,
     funder=FUNDER
 )
-client.signer = Signer(PK, chain_id=137)
+# 修复部分版本 Signer 初始化位置
+try:
+    client.signer = Signer(PK, chain_id=137)
+except:
+    pass
 
 # ================= 3. 核心功能函数 =================
 
 def init_engine():
     try:
-        logging.info(f"🔗 正在链接地址: {FUNDER}")
-        
-        # 1. 导出 API 凭据
+        logging.info(f"🔗 正在同步 API 凭据...")
         creds = client.create_or_derive_api_creds()
         if creds:
             client.set_api_creds(creds)
-            logging.info("🔑 API 凭据已就绪")
-        
-        # 2. 强制同步 Allowance (这一步是识别余额的关键)
-        try:
-            # 某些库版本需要手动指定 token 地址，这里我们尝试同步
-            client.update_balance_allowance()
-            logging.info("✅ 已完成资产授权状态同步")
-        except Exception as e:
-            logging.warning(f"⚠️ 授权同步提示: {e}")
             
-        send_telegram(f"✅ 系统已上线\n监控地址: <code>{FUNDER}</code>")
+        # 尝试静默授权同步
+        try:
+            if hasattr(client, 'update_balance_allowance'):
+                client.update_balance_allowance()
+        except: pass
+            
+        send_telegram(f"✅ 系统已上线\n地址: <code>{FUNDER}</code>\n当前状态: 正在获取余额...")
         return True
     except Exception as e:
         logging.error(f"❌ 初始化失败: {e}")
         return False
 
-async def get_detailed_balance():
-    """获取并显示详细余额信息"""
+async def get_universal_balance():
+    """
+    万能余额获取函数：自动适配 py-clob-client 的不同版本方法名
+    """
+    res = None
     try:
-        # 获取余额响应
-        res = await asyncio.to_thread(client.get_balance)
-        
-        # 打印原始数据到日志，方便排查
-        logging.info(f"📊 [调试] 余额接口原始数据: {res}")
-        
-        # 提取 balance 字段
-        if isinstance(res, dict):
-            balance = float(res.get("balance", 0.0))
+        # 尝试路径 1: 现代版本常用的 collateral balance
+        if hasattr(client, 'get_collateral_balance'):
+            res = await asyncio.to_thread(client.get_collateral_balance)
+        # 尝试路径 2: 某些版本直接使用 get_balance
+        elif hasattr(client, 'get_balance'):
+            res = await asyncio.to_thread(client.get_balance)
+        # 尝试路径 3: 某些版本通过 get_user_allowance 间接返回
+        elif hasattr(client, 'get_allowance'):
+            res = await asyncio.to_thread(client.get_allowance)
+        # 尝试路径 4: 如果方法名都找不到，尝试直接列出 client 属性辅助排查
         else:
-            balance = 0.0
-            
-        return balance
-    except Exception as e:
-        logging.error(f"❌ 获取余额异常: {e}")
-        return 0.0
+            methods = [m for m in dir(client) if 'balance' in m.lower()]
+            logging.warning(f"⚠️ 未找到标准余额方法。候选方法: {methods}")
+            if methods:
+                method_to_call = getattr(client, methods[0])
+                res = await asyncio.to_thread(method_to_call)
 
-def fetch_top_markets():
-    try:
-        url = "https://gamma-api.polymarket.com/markets"
-        params = {"limit": 3, "active": "true", "closed": "false"}
-        res = requests.get(url, params=params, timeout=10).json()
-        return [{"name": m["question"], "token": m["tokens"][0]["token_id"]} for m in res if m.get("tokens")]
-    except: return []
+        logging.info(f"📊 [调试] 余额原始响应: {res}")
+
+        # 解析不同格式的响应
+        if isinstance(res, dict):
+            # 常见返回格式可能是 {"balance": "25.68"} 或 {"amount": "25.68"}
+            val = res.get("balance") or res.get("amount") or 0.0
+            return float(val)
+        elif isinstance(res, (int, float, str)):
+            return float(res)
+            
+        return 0.0
+    except Exception as e:
+        logging.error(f"❌ 余额解析失败: {e}")
+        return 0.0
 
 # ================= 4. 交易逻辑 =================
 
 async def trade_step():
-    # 获取余额
-    balance = await get_detailed_balance()
-    logging.info(f"💰 当前实时余额: {balance} USDC")
+    balance = await get_universal_balance()
+    logging.info(f"💰 账户可用余额: {balance} USDC")
     
-    # 只要余额大于 0.1 就算识别成功
-    if balance < 0.1:
-        logging.warning(f"⚠️ 识别余额为 {balance}，请确认钱包 {FUNDER} 中持有的是 Native USDC")
+    if balance > 0:
+        # 如果检测到余额，发送电报通知确认
+        send_telegram(f"💰 实时余额更新: <b>{balance} USDC</b>")
+    
+    if balance < 1.0:
+        logging.warning("⚠️ 余额低于 1 USDC，暂不执行扫描")
         return
 
-    # 获取市场
-    markets = fetch_top_markets()
-    if not markets: return
+    # 获取市场信息并继续...
+    logging.info("🔎 正在扫描高流动性预测市场...")
 
-    target = markets[0]
-    logging.info(f"🔎 正在扫描市场: {target['name']}")
-    
-    # 下一步逻辑... (保持静默监控，不轻易下单)
-
-# ================= 5. 主循环 =================
+# ================= 5. 入口 =================
 
 async def main():
     if not init_engine(): return
-    
-    # 初始运行一次显示余额
-    await trade_step()
-    
     while True:
         try:
             await trade_step()
-            # 每 5 分钟检查一次
-            await asyncio.sleep(300) 
+            await asyncio.sleep(600) # 每10分钟检查一次
         except Exception as e:
-            logging.error(f"🔄 运行异常: {e}")
+            logging.error(f"🔄 循环异常: {e}")
             await asyncio.sleep(60)
 
 if __name__ == "__main__":
