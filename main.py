@@ -1,37 +1,44 @@
 import time
 import logging
 from trader import execute_trade, get_balance
-from tg import send_message # 确保你的 tg.py 已经按照之前的建议改好
+from scanner import get_active_market_ids  # 👈 导入扫描器
+from tg import send_message
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def lobster_fire_control():
-    logging.info("🚀 龙虾火控系统 V3.2 实盘启动！")
-    send_message("🦞 龙虾火控系统 V3.2 已上线，实盘监控中...")
+    logging.info("🚀 龙虾火控系统 V3.3 实盘启动！(动态 ID 模式)")
+    send_message("🦞 龙虾火控系统 V3.3 已上线！\n监测模式：自动同步动态 ConditionID")
 
     while True:
         try:
-            # 1. 检查弹药
+            # 1. 检查账户余额 (0x365B... 地址)
             balance = get_balance()
             logging.info(f"💰 当前账户余额: {balance} USDC")
 
             if balance < 1.0:
-                logging.warning("⚠️ 余额不足，系统挂机中...")
+                logging.warning("⚠️ 余额不足 (当前: {} USDC)，系统挂机中...".format(balance))
                 time.sleep(60)
                 continue
 
-            # 2. 策略示例：这里可以接入你的指标，比如 RSI 破位或大户跟单
-            # 假设我们现在要对 BTC 进行一次极小额测试
-            # test_resp = execute_trade("BTC", side="UP", price=0.45, size=1)
-            
-            # 3. 轮询监控各币种盘口 (在此处接入你的价格监控逻辑)
-            # for symbol in ["BTC", "ETH", "SOL", "HYPE"]:
-            #    price = get_market_price(symbol)
-            #    if price < 0.3: # 跌过头了，买入反弹
-            #        execute_trade(symbol, "UP", price=0.35, size=2)
+            # 2. 动态同步核心资产盘口
+            assets_to_watch = ["Bitcoin", "Ethereum", "Solana", "Dogecoin", "BNB"]
+            for asset in assets_to_watch:
+                market_data = get_active_market_ids(asset)
+                
+                if market_data:
+                    logging.info(f"📡 监测中: {market_data['question']} (Vol: {market_data['volume']})")
+                    
+                    # --- 这里接入你的策略触发逻辑 ---
+                    # 示例：如果要测试下单 (0.1 USDC 买入 BTC 看涨)
+                    # if asset == "Bitcoin":
+                    #    execute_trade(market_data['up_id'], price=0.5, size=0.2)
+                    # ----------------------------
+                else:
+                    logging.warning(f"❓ 未能找到活跃的 {asset} 盘口")
 
-            logging.info("📡 巡检完成，等待下一轮信号...")
-            time.sleep(300) # 每 5 分钟巡检一次
+            logging.info("✅ 本次巡检完成。系统进入静默监控，5分钟后重新扫描 ID 以防过期。")
+            time.sleep(300) # 完美的 5 分钟循环
 
         except Exception as e:
             logging.error(f"系统运行异常: {e}")
