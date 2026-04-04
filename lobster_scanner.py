@@ -1,43 +1,34 @@
 import requests
 import logging
 
-BASE_GAMMA = "https://gamma-api.polymarket.com"
-# 定义你想监控的资产关键字
-ASSETS = ["Bitcoin", "Ethereum", "Solana", "HYPE", "Dogecoin", "BNB"]
-
-def fetch_active_markets():
-    """实时抓取最新的价格预测盘口 ID"""
-    active_map = {}
+def get_active_market_ids(asset_name="Bitcoin"):
+    """
+    从 Gamma API 动态获取该资产最新的盘口数据
+    asset_name: 'Bitcoin', 'Ethereum', 'Solana' 等
+    """
+    url = "https://gamma-api.polymarket.com/markets"
+    # 搜索包含资产名 + Price 的价格预测盘，且处于活跃状态
+    params = {
+        "active": "true",
+        "closed": "false",
+        "search": f"{asset_name} Price",
+        "limit": 10
+    }
     try:
-        # 搜索包含 "Price" 且处于活跃状态的市场
-        params = {"active": "true", "closed": "false", "search": "Price", "limit": 100}
-        resp = requests.get(f"{BASE_GAMMA}/markets", params=params, timeout=10)
-        markets = resp.json()
-
-        for m in markets:
-            q_text = m.get("question", "")
-            c_id = m.get("conditionId")
-            clob_ids = m.get("clobTokenIds", [])
-
-            if not c_id or len(clob_ids) < 2: continue
-
-            # 匹配资产并确认为价格盘 (排除掉干扰项)
-            for asset in ASSETS:
-                if asset.lower() in q_text.lower() and "above" in q_text.lower():
-                    # 我们只取成交量最大的那个作为当前主力盘
-                    symbol = asset.upper() if asset != "Bitcoin" else "BTC"
-                    if symbol == "ETHEREUM": symbol = "ETH"
-                    if symbol == "DOGECOIN": symbol = "DOGE"
-
-                    if symbol not in active_map or float(m.get("volume", 0)) > active_map[symbol]['volume']:
-                        active_map[symbol] = {
-                            "name": q_text,
-                            "conditionId": c_id,
-                            "UP": clob_ids[0],   # Yes
-                            "DOWN": clob_ids[1], # No
-                            "volume": float(m.get("volume", 0))
-                        }
-        return active_map
+        resp = requests.get(url, params=params, timeout=10).json()
+        # 过滤出包含 'above' 的价格预测盘 (排除世界杯等杂项)
+        valid_markets = [m for m in resp if "above" in m.get("question", "").lower() and m.get("clobTokenIds")]
+        
+        if valid_markets:
+            # 取成交量最大的那个盘口
+            m = max(valid_markets, key=lambda x: float(x.get("volume", 0)))
+            return {
+                "question": m.get("question"),
+                "up_id": m.get("clobTokenIds")[0],   # Yes Token (看涨)
+                "down_id": m.get("clobTokenIds")[1], # No Token (看跌)
+                "condition_id": m.get("conditionId"),
+                "volume": m.get("volume")
+            }
     except Exception as e:
-        logging.error(f"📡 动态市场扫描失败: {e}")
-        return {}
+        logging.error(f"📡 抓取 {asset_name} 盘口失败: {e}")
+    return None
