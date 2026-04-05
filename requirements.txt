@@ -1,3 +1,4 @@
 requests
 websockets==10.4
 python-dotenv
+py-clob-client
