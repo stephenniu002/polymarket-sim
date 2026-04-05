@@ -98,7 +98,7 @@ async def run_lobster_ws():
         except Exception as e:
             # 如果 v1 路径报 404，打印出来我们换路径
             logging.warning(f"⚠️ 连接状态: {e}, 5秒后重试...")
-            await asyncio.sleep(5)
+            await asyncio.sleep(50)
 
 if __name__ == "__main__":
     try:
