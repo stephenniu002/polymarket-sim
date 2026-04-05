@@ -1,5 +1,5 @@
 py-clob-client==0.34.6
-websockets==12.0
+websockets==11.0.3
 httpx==0.28.1
 asyncio
 fastapi
@@ -7,7 +7,7 @@ uvicorn
 python-telegram-bot
 pydantic
 eth-account
-web3==7.15.0
+web3==6.11.1
 requests==2.33.1
 python-dotenv==1.2.2
 eth-account==0.13.7
