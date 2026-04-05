@@ -2,87 +2,94 @@ import os, asyncio, logging
 from py_clob_client.client import ClobClient
 from eth_account import Account
 
-# ================= 1. 变量对齐配置 =================
+# ================= 1. 环境与日志 =================
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# 100% 对齐截图中的变量名
 PK = os.getenv("PRIVATE_KEY")
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-ORDER_SIZE = os.getenv("ORDER_SIZE", "5") # 默认 5
-
 if not PK:
     logging.error("❌ 错误：Railway 变量中未找到 PRIVATE_KEY！")
     exit(1)
 
-# 解析当前运行地址
 _acc = Account.from_key(PK)
 MY_ADDRESS = _acc.address
 
-# 初始化 Polymarket 客户端
-# 强制不传旧的 POLY_API_KEY，让它根据 PRIVATE_KEY 重新推导
+# 初始化客户端
 client = ClobClient(host="https://clob.polymarket.com", key=PK, chain_id=137)
 
-# ================= 2. 核心探测逻辑 =================
+# ================= 2. 强力探测逻辑 (解决 Attribute 报错) =================
 
 async def setup_and_check():
-    """
-    激活 API 权限并穿透探测代理钱包余额
-    """
     try:
-        # A. 激活 API 权限 (L1 -> L2 推导)
+        # A. 激活 API 权限
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
-        logging.info(f"✅ API 权限已对齐 | Key ID: {creds.api_key[:8]}***")
+        logging.info(f"✅ API 权限激活 | Key ID: {creds.api_key[:8]}***")
 
-        # B. 获取专属 L2 代理充值地址 (兼容性处理)
-        proxy_addr = "N/A"
-        try:
-            # 优先尝试推导代理地址
-            proxy_addr = client.get_proxy()
-        except:
-            # 如果失败，通常是因为新钱包还没在链上初始化
-            proxy_addr = MY_ADDRESS
+        # B. 探测 Proxy 地址
+        proxy_addr = MY_ADDRESS
+        for method in ['get_proxy', 'get_proxy_address', 'get_proxy_wallet']:
+            if hasattr(client, method):
+                try:
+                    proxy_addr = getattr(client, method)()
+                    break
+                except: continue
+        logging.info(f"🛡️ 充值/Funder地址: {proxy_addr}")
 
-        logging.info(f"🛡️ 你的【新充值地址】为: {proxy_addr}")
-
-        # C. 探测 USDC 余额
-        res = await asyncio.to_thread(client.get_collateral_balance)
-        
+        # C. 【核心修复】多路径平衡探测
         balance = 0.0
-        if isinstance(res, dict):
-            balance = float(res.get("balance") or 0.0)
-        elif isinstance(res, (str, float, int)):
-            balance = float(res)
+        # 依次尝试新版和旧版的所有余额查询函数
+        methods_to_try = ['get_balance', 'get_collateral_balance', 'get_user_balance']
+        
+        found_method = False
+        for m_name in methods_to_try:
+            if hasattr(client, m_name):
+                try:
+                    logging.info(f"📡 尝试调用方法: {m_name}")
+                    res = await asyncio.to_thread(getattr(client, m_name))
+                    if isinstance(res, dict):
+                        balance = float(res.get("balance") or res.get("amount") or 0.0)
+                    else:
+                        balance = float(res or 0.0)
+                    found_method = True
+                    break
+                except Exception as e:
+                    logging.warning(f"⚠️ 方法 {m_name} 调用失败: {e}")
+        
+        if not found_method:
+            logging.error("❌ SDK 版本异常：找不到任何可用的余额查询函数。")
             
         return balance, proxy_addr
 
     except Exception as e:
-        logging.error(f"❌ 运行异常 (可能需要网页端签名): {e}")
+        logging.error(f"❌ 运行异常: {e}")
         return 0.0, "N/A"
 
 # ================= 3. 主循环 =================
 
 async def main():
-    logging.info(f"🚀 龙虾 V24.0 启动 | 当前地址: {MY_ADDRESS}")
+    logging.info(f"🚀 龙虾 V25.1 (强力探测版) 启动 | 地址: {MY_ADDRESS}")
     
     while True:
         balance, proxy = await setup_and_check()
         
         if balance > 0:
-            logging.info(f"💰 【资产已锁定】余额: {balance} USDC")
-            # 下一步：可以在这里恢复下单逻辑模块
+            logging.info(f"💰 【资产已锁定】当前余额: {balance} USDC")
         else:
             logging.warning("🔎 余额仍为 0。")
-            logging.info(f"💡 需向此地址转入 USDC (Polygon网络): {proxy}")
+            logging.info(f"💡 确认: 钱必须在 Proxy 钱包里，且 PRIVATE_KEY 正确。")
             
-        logging.info("-" * 40)
-        # 确保括号完整闭合
-        await asyncio.sleep(180)
+        logging.info("-" * 45)
+        await asyncio.sleep(120)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("🛑 机器人停止。")
 
 if __name__ == "__main__":
     try:
