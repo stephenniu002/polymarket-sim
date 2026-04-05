@@ -1,4 +1,7 @@
-requests
-websockets==10.4
-python-dotenv
-py-clob-client
+web3==7.15.0
+eth-account==0.13.7
+py-clob-client==0.34.6
+websockets==14.2
+python-dotenv==1.2.2
+python-telegram-bot==22.7
+httpx==0.28.1
