@@ -1,78 +1,78 @@
-import os, asyncio, logging, requests
+import os, asyncio, logging
 from py_clob_client.client import ClobClient
 from eth_account import Account
 
-# ================= 1. 基础配置 =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ================= 1. 基础日志与身份配置 =================
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
+# 从环境变量获取新钱包私钥
 PK = os.getenv("FUNDING_KEY") or os.getenv("PRIVATE_KEY")
+
+if not PK:
+    logging.error("❌ 未检测到私钥！请在 Railway 的 Variables 中设置 PRIVATE_KEY。")
+    exit(1)
+
+# 解析新地址
 _acc = Account.from_key(PK)
-FUNDER = _acc.address
+MY_ADDRESS = _acc.address
 
-# 初始化客户端
-client = ClobClient(host="https://clob.polymarket.com", key=PK, chain_id=137, funder=FUNDER)
+# 初始化 Polymarket 客户端
+# 注意：我们让 SDK 自动推导 funder 和 proxy
+client = ClobClient(host="https://clob.polymarket.com", key=PK, chain_id=137)
 
-# ================= 2. 核心：强制激活与查询 =================
+# ================= 2. 核心功能：权限激活与扫描 =================
 
-async def get_balance_with_activation():
+async def initialize_and_scan():
     """
-    针对 400 错误的终极修复方案
+    一键激活新钱包 API 权限并深度探测余额
     """
     try:
-        # 1. 强制激活逻辑：如果一直 400，说明服务器不认这个 key
-        logging.info("⚡ 正在执行 API 强制激活...")
-        try:
-            # 第一步：先尝试获取现有的，如果不成功会自动抛出异常
-            creds = client.create_or_derive_api_creds()
-            client.set_api_creds(creds)
-            logging.info(f"🔑 凭据激活成功! Key ID: {creds.api_key[:8]}***")
-        except Exception as e:
-            logging.warning(f"⚠️ 自动激活跳过 (可能已存在): {e}")
+        # 1. 握手 API：为新钱包生成 L2 凭据
+        # 运行此行时，如果网页端开着，可能会触发一次小狐狸签名
+        logging.info("🔐 正在建立新地址的 API 握手...")
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        logging.info(f"✅ 权限已激活 | Key ID: {creds.api_key[:8]}***")
 
-        # 2. 深度探测余额
-        # 注意：如果 API Key 没过，下面这些方法都会返回 None 或抛异常
-        res = None
-        for method_name in ['get_collateral_balance', 'get_balance']:
-            if hasattr(client, method_name):
-                try:
-                    # 增加超时控制，防止死锁
-                    res = await asyncio.to_thread(getattr(client, method_name))
-                    if res: break
-                except Exception as inner_e:
-                    logging.debug(f"探测 {method_name} 失败: {inner_e}")
+        # 2. 获取 L2 代理地址 (Proxy Address)
+        # 所有的 USDC 必须转入这个地址才能在 Polymarket 交易
+        proxy_addr = client.get_proxy_address()
+        logging.info(f"🛡️ 你的 L2 代理钱包(Funder): {proxy_addr}")
 
-        logging.info(f"📊 [底层诊断] 原始响应原文: {res}")
+        # 3. 探测余额
+        logging.info("📡 正在同步链上资产数据...")
+        res = await asyncio.to_thread(client.get_collateral_balance)
         
-        # 3. 解析结果
+        balance = 0.0
         if isinstance(res, dict):
-            # Polymarket 常见的返回字段
-            return float(res.get("balance") or res.get("amount") or 0.0)
-        return float(res) if isinstance(res, (int, float, str)) else 0.0
+            balance = float(res.get("balance") or 0.0)
+        elif isinstance(res, (str, float, int)):
+            balance = float(res)
+
+        return balance, proxy_addr
 
     except Exception as e:
-        logging.error(f"❌ 系统穿透失败: {e}")
-        return 0.0
+        logging.error(f"⚠️ 初始化异常: {e}")
+        return 0.0, "N/A"
 
-# ================= 3. 执行循环 =================
+# ================= 3. 监控主循环 =================
 
 async def main():
-    logging.info(f"🚀 龙虾 V18.5 启动 | 监控地址: {FUNDER}")
-    
-    # 初次启动先尝试激活一次
-    await get_balance_with_activation()
+    logging.info(f"🚀 龙虾 V23.0 启动 | 当前地址: {MY_ADDRESS}")
     
     while True:
-        balance = await get_balance_with_activation()
+        balance, proxy = await initialize_and_scan()
         
         if balance > 0:
-            logging.info(f"💰 【钱抓到了！】当前余额: {balance} USDC")
+            logging.info(f"💰 【资产锁定成功】余额: {balance} USDC")
+            # 在此处可以接入你之前的下单逻辑 (e.g., auto_hunter)
         else:
-            logging.warning("🔎 余额仍为 0。请执行以下【必杀技】：")
-            logging.info("1. 打开 Polymarket 网页并登录")
-            logging.info("2. 点击右上角钱包 -> Settings -> API Keys")
-            logging.info("3. 删掉现有的 Key，让机器人重新生成")
+            logging.warning("🔎 余额为 0。如果是新钱包，请确保已充值。")
+            logging.info(f"💡 请向该地址转入 USDC (Polygon网络): {proxy}")
             
-        await asyncio.sleep(120) # 缩短为 2 分钟，加快同步
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        logging.info("-------------------------------------------")
+        await asyncio.sleep(18
