@@ -1,42 +1,54 @@
-import asyncio
-from ws_engine import run_ws
-from strategy import generate_signal
-from trader import execute_trade
+from py_clob_client.client import ClobClient
+from py_clob_client.constants import POLYGON
+import os
 
-cooldown = {}
+# ===============================
+# 初始化（只做一次）
+# ===============================
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    key=os.getenv("POLY_API_KEY"),
+    secret=os.getenv("POLY_SECRET"),
+    passphrase=os.getenv("POLY_PASSPHRASE"),
+    chain_id=POLYGON,
+    private_key=os.getenv("PRIVATE_KEY")
+)
 
-
-async def on_market(market, state):
-    if market in cooldown:
-        return
-
-    signal = generate_signal(state)
-
-    if not signal:
-        return
-
-    # 👉 简单强度计算
-    strength = len(state["trades"]) / 50
-
-    token_id = state["trades"][-1]["token_id"]
-    price = state["trades"][-1]["price"]
-
-    print(f"🎯 {market} 信号: {signal} | 强度: {strength:.2f}")
-
-    execute_trade(market, token_id, signal, price, strength)
-
-    cooldown[market] = True
-
-    # 冷却60秒
-    await asyncio.sleep(60)
-    cooldown.pop(market, None)
+# 🔥 很关键（有些环境必须）
+try:
+    client.derive_api_key()
+    print("✅ API 已激活")
+except:
+    pass
 
 
-async def main():
-    print("🚀 V30 实时交易系统启动")
+# ===============================
+# 下单（最终版）
+# ===============================
+def place_order(token_id, side):
+    try:
+        print(f"🧪 准备下单: {side} | {token_id}")
 
-    await run_ws(on_market)
+        if not REAL_TRADE:
+            print("⚠️ 当前模拟模式")
+            return
 
+        # ⚠️ Polymarket 规则：
+        # BUY = 买这个 token（YES 或 NO）
+        # SELL = 卖（一般不用）
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        order = client.create_order(
+            token_id=token_id,
+            price=0.5,   # 建议后面换成盘口价
+            size=1.0,    # 先小仓测试
+            side="BUY"
+        )
+
+        signed = client.sign_order(order)
+
+        res = client.post_order(signed)
+
+        print("📤 下单成功:", res)
+
+    except Exception as e:
+        print("❌ 下单失败:", e)
