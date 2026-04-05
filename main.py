@@ -113,7 +113,7 @@ async def run_lobster_ws():
 
         except Exception as e:
             logging.warning(f"⚠️ 连接状态异常: {e}, 5秒后尝试重连...")
-            await asyncio.sleep(5)
+            await asyncio.sleep(50)
 
 if __name__ == "__main__":
     try:
