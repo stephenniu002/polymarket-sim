@@ -6,7 +6,7 @@ import time
 import os
 
 # ==========================================
-# 1. 核心配置与导入 (对齐 config.py)
+# 1. 配置加载 (对齐你 Git 上的 config.py)
 # ==========================================
 try:
     from trade import execute_trade 
@@ -14,70 +14,62 @@ try:
     from config import MARKET_MAP, POLY_ADDRESS
     logging.info("✅ 配置文件 [config.py] 加载成功")
 except ImportError as e:
-    logging.error(f"❌ 导入失败: {e}。请确认 config.py 中有 MARKET_MAP 变量。")
+    logging.error(f"❌ 导入失败: {e}")
     MARKET_MAP = {}
-    POLY_ADDRESS = "0xd962C11e253e38EB86303F1462818c4aac17CB24"
+    POLY_ADDRESS = os.getenv("POLY_ADDRESS", "0xd962C11e253e38EB86303F1462818c4aac17CB24")
 
-# 日志格式
-logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ⚠️ 修复 404 的核心：添加末尾斜杠 / 或 v1 路径
-WS_URL = "wss://clob.polymarket.com/ws/" 
+# ⚠️ 修复 404 的关键路径 (带 v1 往往比直接带斜杠更稳)
+WS_URL = "wss://clob.polymarket.com/ws/v1" 
 
-# ==========================================
-# 2. 资产 ID 预处理 (对齐 UP/DOWN 键)
-# ==========================================
 WATCH_TOKENS = []
 for m in MARKET_MAP.values():
     if "UP" in m: WATCH_TOKENS.append(m["UP"])
     if "DOWN" in m: WATCH_TOKENS.append(m["DOWN"])
 
-# 状态缓存
 markets_state = {}
 cooldowns = {}
 COOLDOWN_SECONDS = 20 
 
 # ==========================================
-# 3. 核心事件处理器
+# 2. 逻辑处理器
 # ==========================================
-async def handle_market_event(market_id, state):
+async def handle_market_event(m_id, t_id, data):
     now = time.time()
-
-    # 冷却与数据完整性检查
-    if market_id in cooldowns and now - cooldowns[market_id] < COOLDOWN_SECONDS:
-        return
     
-    if not state.get("last_price") or not state.get("last_token"):
-        return
-
-    # 信号生成 (strategy.py)
-    signal = generate_signal(state)
-    if not signal:
-        return
-
-    # 匹配币种符号
-    symbol = "UNKNOWN"
-    token_id = state["last_token"]
-    for k, v in MARKET_MAP.items():
-        if token_id in [v.get("UP"), v.get("DOWN")]:
-            symbol = k
-            break
+    # 初始化状态
+    if m_id not in markets_state:
+        markets_state[m_id] = {"trades": [], "last_price": None, "last_token": None}
     
-    # 强度计算 (成交密度)
-    strength = min(len(state.get("trades", [])) / 30, 1.0)
+    state = markets_state[m_id]
     
-    logging.info(f"🎯 [SIGNAL] {symbol} | {signal} | 价格: {state['last_price']} | 强度: {strength:.2f}")
-    
-    # 执行下单 (trade.py)
-    execute_trade(symbol, token_id, signal, state["last_price"], strength)
+    # 更新成交数据
+    if data.get("type") == "trade":
+        state["trades"].append(data)
+        if len(state["trades"]) > 40: state["trades"].pop(0)
+        state["last_price"] = data.get("price")
+        state["last_token"] = t_id
+        
+        # 信号检查 (冷却控制)
+        if m_id in cooldowns and now - cooldowns[m_id] < COOLDOWN_SECONDS:
+            return
 
-    cooldowns[market_id] = now
+        signal = generate_signal(state)
+        if signal:
+            symbol = "UNKNOWN"
+            for k, v in MARKET_MAP.items():
+                if t_id in [v.get("UP"), v.get("DOWN")]:
+                    symbol = k
+                    break
+            
+            strength = min(len(state["trades"]) / 30, 1.0)
+            logging.info(f"🎯 [SIGNAL] {symbol} | {signal} | 价: {state['last_price']} | 强: {strength:.2f}")
+            execute_trade(symbol, t_id, signal, state["last_price"], strength)
+            cooldowns[m_id] = now
 
 # ==========================================
-# 4. WebSocket 链接引擎 (修复 404)
+# 3. 核心引擎 (修正缩进与路径)
 # ==========================================
 async def run_lobster_ws():
     logging.info(f"🚀 龙虾系统启动 | 监听钱包: {POLY_ADDRESS}")
@@ -86,23 +78,35 @@ async def run_lobster_ws():
         logging.error("❌ 监听列表为空！请检查 config.py")
         return
 
-    # 伪装 Header 绕过某些反爬策略
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     while True:
         try:
+            logging.info(f"📡 正在尝试连接: {WS_URL}")
             async with websockets.connect(WS_URL, extra_headers=headers) as ws:
-                logging.info("✅ WebSocket 连接成功 [101 Switching Protocols]")
+                logging.info("✅ WebSocket 连接成功 (101)")
                 
-                # 订阅消息
                 subscribe_msg = {
                     "type": "subscribe",
                     "channels": ["trades"],
                     "tokens": WATCH_TOKENS
                 }
                 await ws.send(json.dumps(subscribe_msg))
-                logging.info(f"📡 订阅已发送: 正在监控 {len(WATCH_TOKENS)} 个 Token")
-
+                
+                # 修复后的缩进块
                 async for msg in ws:
+                    data = json.loads(msg)
+                    m_id = data.get("market")
+                    t_id = data.get("token_id")
+                    if m_id and t_id:
+                        await handle_market_event(m_id, t_id, data)
+
+        except Exception as e:
+            logging.warning(f"⚠️ 连接异常: {e}, 5秒后重试...")
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_lobster_ws())
+    except KeyboardInterrupt:
+        logging.info("🛑 系统手动停止")
