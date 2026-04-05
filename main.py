@@ -6,20 +6,20 @@ import time
 import os
 
 # ==========================================
-# 1. 配置加载 (对齐 config.py)
+# 1. 配置文件加载 (对齐 config.py)
 # ==========================================
 try:
     from trade import execute_trade 
     from strategy import generate_signal
     from config import MARKET_MAP, POLY_ADDRESS
-    logging.info("✅ 配置文件加载成功")
+    logging.info("✅ config.py 加载成功")
 except ImportError:
     MARKET_MAP = {}
-    POLY_ADDRESS = os.getenv("POLY_ADDRESS", "0xd962C11e253e38EB86303F1462818c4aac17CB24")
+    POLY_ADDRESS = os.getenv("POLY_ADDRESS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ⚠️ 尝试最标准的路径
+# ⚠️ 统一使用 v1 路径，这是目前最稳的
 WS_URL = "wss://clob.polymarket.com/ws/v1" 
 
 WATCH_TOKENS = []
@@ -47,6 +47,7 @@ async def handle_market_event(m_id, t_id, data):
         state["last_price"] = data.get("price")
         state["last_token"] = t_id
         
+        # 冷却控制
         if m_id in cooldowns and now - cooldowns[m_id] < COOLDOWN_SECONDS:
             return
 
@@ -64,19 +65,19 @@ async def handle_market_event(m_id, t_id, data):
             cooldowns[m_id] = now
 
 # ==========================================
-# 3. 核心引擎 (删除报错参数 extra_headers)
+# 3. WebSocket 引擎 (移除 extra_headers 彻底解决报错)
 # ==========================================
 async def run_lobster_ws():
-    logging.info(f"🚀 龙虾系统启动 | 目标地址: {POLY_ADDRESS}")
+    logging.info(f"🚀 龙虾系统启动 | 监听钱包: {POLY_ADDRESS}")
     
     if not WATCH_TOKENS:
-        logging.error("❌ 监听列表为空！请检查 config.py")
+        logging.error("❌ 监听列表为空！请检查 config.py 中的 MARKET_MAP")
         return
 
     while True:
         try:
             logging.info(f"📡 正在尝试连接: {WS_URL}")
-            # 去掉 extra_headers，避免版本不兼容报错
+            # 这里去掉了所有版本敏感的参数，只保留最基本的 URL
             async with websockets.connect(WS_URL) as ws:
                 logging.info("✅ WebSocket 连接成功 (101)")
                 
@@ -86,7 +87,7 @@ async def run_lobster_ws():
                     "tokens": WATCH_TOKENS
                 }
                 await ws.send(json.dumps(subscribe_msg))
-                logging.info(f"📡 已订阅 {len(WATCH_TOKENS)} 个资产 ID")
+                logging.info(f"📡 订阅发送完成，监控资产数: {len(WATCH_TOKENS)}")
                 
                 async for msg in ws:
                     data = json.loads(msg)
@@ -96,12 +97,12 @@ async def run_lobster_ws():
                         await handle_market_event(m_id, t_id, data)
 
         except Exception as e:
-            # 如果 v1 路径报 404，打印出来我们换路径
-            logging.warning(f"⚠️ 连接状态: {e}, 5秒后重试...")
+            # 这里的 e 如果依然报 404，说明路径需要微调
+            logging.warning(f"⚠️ 连接状态异常: {e}, 5秒后重连...")
             await asyncio.sleep(50)
 
 if __name__ == "__main__":
     try:
         asyncio.run(run_lobster_ws())
     except KeyboardInterrupt:
-        logging.info("🛑 停止")
+        logging.info("🛑 系统手动下线")
