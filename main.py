@@ -1,221 +1,208 @@
 import os
+import asyncio
+import logging
 import time
 import requests
-import logging
-from trade import execute_trade  # 你的交易下单模块
-from strategy import generate_signal  # 你的信号策略模块
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.signer import Signer
 
-# ===============================
-# 🔹 日志配置
-# ===============================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+# ================= 日志 =================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.info("🚀 polymarket-sim: V17.2 (7币全覆盖版) 启动")
+
+# ================= 环境变量 =================
+PK = os.getenv("FOX_PRIVATE_KEY")
+FUNDER = os.getenv("Funder")
+
+if not PK or not PK.startswith("0x"):
+    raise Exception("🛑 FOX_PRIVATE_KEY 未正确配置（必须0x开头）")
+
+logging.info(f"🔗 正在为地址 {FUNDER[:10]}... 激活链路...")
+
+# ================= 客户端 =================
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    key=PK,
+    chain_id=137,
+    funder=FUNDER
 )
 
-# ===============================
-# 🔹 Telegram 配置（可选）
-# ===============================
-TG_TOKEN = os.getenv("TG_TOKEN") or "your_telegram_bot_token"
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "your_chat_id"
+client.signer = Signer(PK, chain_id=137)
+if client.signer is None:
+    raise Exception("🛑 signer 初始化失败")
 
-def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg})
-    except Exception as e:
-        logging.warning(f"⚠️ Telegram 发送失败: {e}")
-
-# ===============================
-# 🔹 POLYMARKET 7币 TOKEN_ID 全覆盖
-# ===============================
+# ================= 7币 TOKEN_ID =================
 MARKETS = {
-    "BTC": {
-        "UP": "68033518322462371935856735251001652798688532944534600565715682414078422713363",
-        "DOWN": "42290470910454159474303047950885744851262714754899371843021423088168640872907"
-    },
-    "ETH": {
-        "UP": "22697677844037973694672765750606352785901003559149933535427801487665640947803",
-        "DOWN": "115090385978773385923886371350527743245393288513466835985021881253014596643630"
-    },
-    "SOL": {
-        "UP": "104603314801857341640835854350038686011870944676564680074680431702449050206849",
-        "DOWN": "109356807032619845857448714056328897846193614693799092745423146063644528271739"
-    },
-    "ARB": {
-        "UP": "83969554674239323125534841773025419295324024187242141567151123418758917736351",
-        "DOWN": "55696486755928578342776003278410729069499785313927089760850183610072430890445"
-    },
-    "OP": {
-        "UP": "102762789132004280347110241206954008153952900365785095086032215198759595021055",
-        "DOWN": "114844319908492689652356903444093235582805928777096660934420753771345312987663"
-    },
-    "DOGE": {
-        "UP": "106625082417191245995145458652026897669356408589941137585886068627196204381551",
-        "DOWN": "70904302110360626667376939927906146916424503243022738450880960377487226196037"
-    },
-    "MATIC": {
-        "UP": "113731536206314593343123440641902754070657405235286809042047205745082834474083",
-        "DOWN": "70757969820078082396704681961608768251154072300114355273498766356711024291765"
-    }
+    "BTC": {"UP": "68033518322462371935856735251001652798688532944534600565715682414078422713363",
+            "DOWN": "42290470910454159474303047950885744851262714754899371843021423088168640872907"},
+    "ETH": {"UP": "22697677844037973694672765750606352785901003559149933535427801487665640947803",
+            "DOWN": "115090385978773385923886371350527743245393288513466835985021881253014596643630"},
+    "SOL": {"UP": "104603314801857341640835854350038686011870944676564680074680431702449050206849",
+            "DOWN": "109356807032619845857448714056328897846193614693799092745423146063644528271739"},
+    "ARB": {"UP": "83969554674239323125534841773025419295324024187242141567151123418758917736351",
+            "DOWN": "55696486755928578342776003278410729069499785313927089760850183610072430890445"},
+    "OP": {"UP": "102762789132004280347110241206954008153952900365785095086032215198759595021055",
+           "DOWN": "114844319908492689652356903444093235582805928777096660934420753771345312987663"},
+    "DOGE": {"UP": "106625082417191245995145458652026897669356408589941137585886068627196204381551",
+             "DOWN": "70904302110360626667376939927906146916424503243022738450880960377487226196037"},
+    "MATIC": {"UP": "113731536206314593343123440641902754070657405235286809042047205745082834474083",
+              "DOWN": "70757969820078082396704681961608768251154072300114355273498766356711024291765"}
 }
 
-# ===============================
-# 🔹 POLYMARKET API 基础地址
-# ===============================
-BASE_URL = "https://clob.polymarket.com"
-
-# ===============================
-# 🔹 获取最近成交（可选）
-# ===============================
-def get_trades(token_id):
+# ================= 初始化 =================
+def init_engine():
     try:
-        url = f"{BASE_URL}/trades?token_id={token_id}"
-        res = requests.get(url, timeout=5)
-        return res.json()
+        logging.info("🔧 V17.2 启动：标准初始化模式...")
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        try:
+            client.update_balance_allowance()
+        except Exception as e:
+            logging.warning(f"⚠️ Allowance 跳过: {e}")
+        logging.info("✅ 引擎初始化完成，交易链路已打通")
+        return True
     except Exception as e:
-        logging.warning(f"⚠️ 获取成交失败: {e}")
+        logging.error(f"❌ 引擎初始化失败: {e}")
+        return False
+
+# ================= 余额 =================
+async def get_balance():
+    try:
+        if hasattr(client, "get_balance"):
+            res = await asyncio.to_thread(client.get_balance)
+            return float(res.get("balance", 0))
+        elif hasattr(client, "get_user_balance"):
+            res = await asyncio.to_thread(client.get_user_balance)
+            return float(res.get("balance", 0))
+        return -1
+    except Exception as e:
+        logging.error(f"❌ 余额获取失败: {e}")
+        return -1
+
+# ================= Gamma =================
+def fetch_markets():
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {"limit": 20, "active": "true"}
+    try:
+        res = requests.get(url, params=params, timeout=10).json()
+        markets = []
+        for m in res:
+            vol = float(m.get("volume", 0))
+            tokens = m.get("tokens", [])
+            if vol > 1000 and len(tokens) >= 2:
+                markets.append({
+                    "name": m["question"],
+                    "token": tokens[0]["token_id"],
+                    "volume": vol
+                })
+        markets.sort(key=lambda x: x["volume"], reverse=True)
+        return markets[:5]
+    except Exception as e:
+        logging.error(f"⚠️ Gamma API 异常: {e}")
         return []
 
-# ===============================
-# 🔹 主逻辑示例
-# ===============================
-def main():
-    logging.info("🦞 实盘系统启动")
-    while True:
-        try:
-            for symbol, tokens in MARKETS.items():
-                # 示例：获取最新交易信号
-                signal = generate_signal(symbol)  # 返回 "UP" 或 "DOWN"
-                token_id = tokens.get(signal)
-                if not token_id:
-                    logging.warning(f"⚠️ {symbol} {signal} 未配置 TOKEN_ID")
-                    continue
+# ================= 盘口 =================
+def is_tradeable(token):
+    try:
+        ob = client.get_order_book(token)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if not bids or not asks:
+            return False
+        spread = float(asks[0][0]) - float(bids[0][0])
+        return spread < 0.05
+    except:
+        return False
 
-                # 执行交易
-                execute_trade(symbol, token_id, signal)
-                logging.info(f"✅ {symbol} 下单 {signal}")
+# ================= 价格 =================
+def get_price(token):
+    try:
+        ob = client.get_order_book(token)
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
+        if not bids or not asks:
+            return 0.2
+        return round((float(bids[0][0]) + float(asks[0][0])) / 2, 3)
+    except:
+        return 0.2
 
-            time.sleep(5)  # 每 5 秒循环一次，可调
-        except Exception as e:
-            logging.error(f"❌ 系统异常: {e}")
-            send_telegram(f"❌ 系统异常: {e}")
-            time.sleep(10)
+# ================= 风控 =================
+trade_history = []
+cooldown_until = 0
+def can_trade():
+    global cooldown_until
+    if time.time() < cooldown_until:
+        return False
+    if len(trade_history) >= 3 and all(x == "LOSE" for x in trade_history[-3:]):
+        cooldown_until = time.time() + 600
+        logging.warning("🛑 连续亏损，暂停10分钟")
+        return False
+    return True
 
-# ===============================
-# 🔹 入口
-# ===============================
-if __name__ == "__main__":
-    main()import os
-import time
-import requests
-import logging
-from trade import execute_trade  # 你的交易下单模块
-from strategy import generate_signal  # 你的信号策略模块
+# ================= 下单 =================
+async def execute(token, name, balance):
+    try:
+        size = max(0.1, round(balance * 0.1, 2))
+        price = get_price(token)
+        order = OrderArgs(
+            price=price,
+            size=size,
+            side="buy",
+            token_id=str(token)
+        )
+        def _do():
+            signed = client.create_order(order)
+            return client.post_order(signed, OrderType.GTC)
+        res = await asyncio.to_thread(_do)
+        if res and res.get("success"):
+            logging.info(f"🎯 【交易成功】{name} | {size}")
+            trade_history.append("WIN")
+        else:
+            logging.warning(f"❌ 【下单失败】{res}")
+            trade_history.append("LOSE")
+    except Exception as e:
+        logging.error(f"❌ 交易异常: {e}")
+        trade_history.append("LOSE")
 
-# ===============================
-# 🔹 日志配置
-# ===============================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-# ===============================
-# 🔹 Telegram 配置（可选）
-# ===============================
-TG_TOKEN = os.getenv("TG_TOKEN") or "your_telegram_bot_token"
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "your_chat_id"
-
-def send_telegram(msg):
-    if not TG_TOKEN or not TG_CHAT_ID:
+# ================= 主循环 =================
+async def step():
+    logging.info("💓 polymarket-sim heartbeat")
+    if not can_trade():
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg})
-    except Exception as e:
-        logging.warning(f"⚠️ Telegram 发送失败: {e}")
+    balance = await get_balance()
+    if balance <= 0:
+        logging.warning("💰 余额异常")
+        return
+    logging.info(f"💰 账户余额: {balance}")
+    # 先交易固定币
+    for symbol, tokens in MARKETS.items():
+        token_id = tokens["UP"]
+        if is_tradeable(token_id):
+            logging.info(f"🎯 锁定固定市场: {symbol}")
+            await execute(token_id, symbol, balance)
+            return
+    # 动态市场作为备选
+    markets = fetch_markets()
+    for m in markets:
+        if is_tradeable(m["token"]):
+            logging.info(f"🎯 锁定动态市场: {m['name']}")
+            await execute(m["token"], m["name"], balance)
+            return
+    logging.warning("⚠️ 无可交易市场")
 
-# ===============================
-# 🔹 POLYMARKET 7币 TOKEN_ID 全覆盖
-# ===============================
-MARKETS = {
-    "BTC": {
-        "UP": "68033518322462371935856735251001652798688532944534600565715682414078422713363",
-        "DOWN": "42290470910454159474303047950885744851262714754899371843021423088168640872907"
-    },
-    "ETH": {
-        "UP": "22697677844037973694672765750606352785901003559149933535427801487665640947803",
-        "DOWN": "115090385978773385923886371350527743245393288513466835985021881253014596643630"
-    },
-    "SOL": {
-        "UP": "104603314801857341640835854350038686011870944676564680074680431702449050206849",
-        "DOWN": "109356807032619845857448714056328897846193614693799092745423146063644528271739"
-    },
-    "ARB": {
-        "UP": "83969554674239323125534841773025419295324024187242141567151123418758917736351",
-        "DOWN": "55696486755928578342776003278410729069499785313927089760850183610072430890445"
-    },
-    "OP": {
-        "UP": "102762789132004280347110241206954008153952900365785095086032215198759595021055",
-        "DOWN": "114844319908492689652356903444093235582805928777096660934420753771345312987663"
-    },
-    "DOGE": {
-        "UP": "106625082417191245995145458652026897669356408589941137585886068627196204381551",
-        "DOWN": "70904302110360626667376939927906146916424503243022738450880960377487226196037"
-    },
-    "MATIC": {
-        "UP": "113731536206314593343123440641902754070657405235286809042047205745082834474083",
-        "DOWN": "70757969820078082396704681961608768251154072300114355273498766356711024291765"
-    }
-}
-
-# ===============================
-# 🔹 POLYMARKET API 基础地址
-# ===============================
-BASE_URL = "https://clob.polymarket.com"
-
-# ===============================
-# 🔹 获取最近成交（可选）
-# ===============================
-def get_trades(token_id):
-    try:
-        url = f"{BASE_URL}/trades?token_id={token_id}"
-        res = requests.get(url, timeout=5)
-        return res.json()
-    except Exception as e:
-        logging.warning(f"⚠️ 获取成交失败: {e}")
-        return []
-
-# ===============================
-# 🔹 主逻辑示例
-# ===============================
-def main():
-    logging.info("🦞 实盘系统启动")
+# ================= 主入口 =================
+async def main():
+    if not init_engine():
+        logging.critical("🛑 初始化失败，程序退出。请检查 Railway 环境变量！")
+        return
     while True:
         try:
-            for symbol, tokens in MARKETS.items():
-                # 示例：获取最新交易信号
-                signal = generate_signal(symbol)  # 返回 "UP" 或 "DOWN"
-                token_id = tokens.get(signal)
-                if not token_id:
-                    logging.warning(f"⚠️ {symbol} {signal} 未配置 TOKEN_ID")
-                    continue
-
-                # 执行交易
-                execute_trade(symbol, token_id, signal)
-                logging.info(f"✅ {symbol} 下单 {signal}")
-
-            time.sleep(5)  # 每 5 秒循环一次，可调
+            await step()
+            await asyncio.sleep(300)
         except Exception as e:
-            logging.error(f"❌ 系统异常: {e}")
-            send_telegram(f"❌ 系统异常: {e}")
-            time.sleep(10)
+            logging.error(f"💥 系统异常: {e}")
+            await asyncio.sleep(5)
 
-# ===============================
-# 🔹 入口
-# ===============================
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
