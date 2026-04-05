@@ -2,118 +2,220 @@ import os
 import time
 import requests
 import logging
+from trade import execute_trade  # 你的交易下单模块
+from strategy import generate_signal  # 你的信号策略模块
 
 # ===============================
-# 基础配置
+# 🔹 日志配置
 # ===============================
-BASE = "https://clob.polymarket.com"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ===============================
+# 🔹 Telegram 配置（可选）
+# ===============================
+TG_TOKEN = os.getenv("TG_TOKEN") or "your_telegram_bot_token"
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "your_chat_id"
 
-# 从环境变量读取
-TOKENS = {
-    "BTC": os.getenv("BTC_TOKEN_ID"),
-    "ETH": os.getenv("ETH_TOKEN_ID"),
-    "SOL": os.getenv("SOL_TOKEN_ID"),
-    "ARB": os.getenv("ARB_TOKEN_ID"),
-    "OP": os.getenv("OP_TOKEN_ID"),
-    "DOGE": os.getenv("DOGE_TOKEN_ID"),
-    "MATIC": os.getenv("MATIC_TOKEN_ID"),
+def send_telegram(msg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg})
+    except Exception as e:
+        logging.warning(f"⚠️ Telegram 发送失败: {e}")
+
+# ===============================
+# 🔹 POLYMARKET 7币 TOKEN_ID 全覆盖
+# ===============================
+MARKETS = {
+    "BTC": {
+        "UP": "68033518322462371935856735251001652798688532944534600565715682414078422713363",
+        "DOWN": "42290470910454159474303047950885744851262714754899371843021423088168640872907"
+    },
+    "ETH": {
+        "UP": "22697677844037973694672765750606352785901003559149933535427801487665640947803",
+        "DOWN": "115090385978773385923886371350527743245393288513466835985021881253014596643630"
+    },
+    "SOL": {
+        "UP": "104603314801857341640835854350038686011870944676564680074680431702449050206849",
+        "DOWN": "109356807032619845857448714056328897846193614693799092745423146063644528271739"
+    },
+    "ARB": {
+        "UP": "83969554674239323125534841773025419295324024187242141567151123418758917736351",
+        "DOWN": "55696486755928578342776003278410729069499785313927089760850183610072430890445"
+    },
+    "OP": {
+        "UP": "102762789132004280347110241206954008153952900365785095086032215198759595021055",
+        "DOWN": "114844319908492689652356903444093235582805928777096660934420753771345312987663"
+    },
+    "DOGE": {
+        "UP": "106625082417191245995145458652026897669356408589941137585886068627196204381551",
+        "DOWN": "70904302110360626667376939927906146916424503243022738450880960377487226196037"
+    },
+    "MATIC": {
+        "UP": "113731536206314593343123440641902754070657405235286809042047205745082834474083",
+        "DOWN": "70757969820078082396704681961608768251154072300114355273498766356711024291765"
+    }
 }
 
 # ===============================
-# 获取成交数据
+# 🔹 POLYMARKET API 基础地址
+# ===============================
+BASE_URL = "https://clob.polymarket.com"
+
+# ===============================
+# 🔹 获取最近成交（可选）
 # ===============================
 def get_trades(token_id):
     try:
-        url = f"{BASE}/trades?token_id={token_id}"
+        url = f"{BASE_URL}/trades?token_id={token_id}"
         res = requests.get(url, timeout=5)
-        data = res.json()
-
-        if not isinstance(data, list):
-            return []
-
-        return data[-20:]  # 最近20笔
+        return res.json()
     except Exception as e:
-        logging.error(f"❌ 获取 trades 失败: {e}")
+        logging.warning(f"⚠️ 获取成交失败: {e}")
         return []
 
 # ===============================
-# 信号生成（核心策略）
+# 🔹 主逻辑示例
 # ===============================
-def generate_signal(trades):
-    buy = 0
-    sell = 0
-
-    for t in trades:
-        side = t.get("side", "")
-        size = float(t.get("size", 0))
-
-        if side == "buy":
-            buy += size
-        elif side == "sell":
-            sell += size
-
-    # 防止除0
-    if buy == 0 and sell == 0:
-        return "HOLD"
-
-    # ===== 核心逻辑 =====
-    if sell > buy * 1.5:
-        return "SELL"
-    elif buy > sell * 1.5:
-        return "BUY"
-    else:
-        return "HOLD"
-
-# ===============================
-# 模拟下单（你可以换真实API）
-# ===============================
-def execute_trade(symbol, signal):
-    if signal == "HOLD":
-        return
-
-    logging.info(f"🚀 {symbol} 信号: {signal}")
-
-    # 👉 实盘这里替换为真实下单
-    # 例如：clob_client.create_order(...)
-    # 当前先打印
-    logging.info(f"📈 模拟下单: {symbol} -> {signal}")
-
-# ===============================
-# 主循环
-# ===============================
-def run():
-    logging.info("🦞 实盘系统启动成功")
-
+def main():
+    logging.info("🦞 实盘系统启动")
     while True:
-        for symbol, token_id in TOKENS.items():
+        try:
+            for symbol, tokens in MARKETS.items():
+                # 示例：获取最新交易信号
+                signal = generate_signal(symbol)  # 返回 "UP" 或 "DOWN"
+                token_id = tokens.get(signal)
+                if not token_id:
+                    logging.warning(f"⚠️ {symbol} {signal} 未配置 TOKEN_ID")
+                    continue
 
-            if not token_id:
-                logging.warning(f"⚠️ {symbol} 未配置 TOKEN_ID")
-                continue
+                # 执行交易
+                execute_trade(symbol, token_id, signal)
+                logging.info(f"✅ {symbol} 下单 {signal}")
 
-            trades = get_trades(token_id)
-
-            if not trades:
-                logging.warning(f"⚠️ {symbol} 无交易数据")
-                continue
-
-            signal = generate_signal(trades)
-
-            logging.info(f"{symbol} → {signal}")
-
-            execute_trade(symbol, signal)
-
-        time.sleep(10)  # 每10秒跑一轮
-
+            time.sleep(5)  # 每 5 秒循环一次，可调
+        except Exception as e:
+            logging.error(f"❌ 系统异常: {e}")
+            send_telegram(f"❌ 系统异常: {e}")
+            time.sleep(10)
 
 # ===============================
-# 启动
+# 🔹 入口
 # ===============================
 if __name__ == "__main__":
+    main()import os
+import time
+import requests
+import logging
+from trade import execute_trade  # 你的交易下单模块
+from strategy import generate_signal  # 你的信号策略模块
+
+# ===============================
+# 🔹 日志配置
+# ===============================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ===============================
+# 🔹 Telegram 配置（可选）
+# ===============================
+TG_TOKEN = os.getenv("TG_TOKEN") or "your_telegram_bot_token"
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "your_chat_id"
+
+def send_telegram(msg):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        run()
+        requests.post(url, data={"chat_id": TG_CHAT_ID, "text": msg})
     except Exception as e:
-        logging.error(f"❌ 崩溃: {e}")
-        time.sleep(5)
+        logging.warning(f"⚠️ Telegram 发送失败: {e}")
+
+# ===============================
+# 🔹 POLYMARKET 7币 TOKEN_ID 全覆盖
+# ===============================
+MARKETS = {
+    "BTC": {
+        "UP": "68033518322462371935856735251001652798688532944534600565715682414078422713363",
+        "DOWN": "42290470910454159474303047950885744851262714754899371843021423088168640872907"
+    },
+    "ETH": {
+        "UP": "22697677844037973694672765750606352785901003559149933535427801487665640947803",
+        "DOWN": "115090385978773385923886371350527743245393288513466835985021881253014596643630"
+    },
+    "SOL": {
+        "UP": "104603314801857341640835854350038686011870944676564680074680431702449050206849",
+        "DOWN": "109356807032619845857448714056328897846193614693799092745423146063644528271739"
+    },
+    "ARB": {
+        "UP": "83969554674239323125534841773025419295324024187242141567151123418758917736351",
+        "DOWN": "55696486755928578342776003278410729069499785313927089760850183610072430890445"
+    },
+    "OP": {
+        "UP": "102762789132004280347110241206954008153952900365785095086032215198759595021055",
+        "DOWN": "114844319908492689652356903444093235582805928777096660934420753771345312987663"
+    },
+    "DOGE": {
+        "UP": "106625082417191245995145458652026897669356408589941137585886068627196204381551",
+        "DOWN": "70904302110360626667376939927906146916424503243022738450880960377487226196037"
+    },
+    "MATIC": {
+        "UP": "113731536206314593343123440641902754070657405235286809042047205745082834474083",
+        "DOWN": "70757969820078082396704681961608768251154072300114355273498766356711024291765"
+    }
+}
+
+# ===============================
+# 🔹 POLYMARKET API 基础地址
+# ===============================
+BASE_URL = "https://clob.polymarket.com"
+
+# ===============================
+# 🔹 获取最近成交（可选）
+# ===============================
+def get_trades(token_id):
+    try:
+        url = f"{BASE_URL}/trades?token_id={token_id}"
+        res = requests.get(url, timeout=5)
+        return res.json()
+    except Exception as e:
+        logging.warning(f"⚠️ 获取成交失败: {e}")
+        return []
+
+# ===============================
+# 🔹 主逻辑示例
+# ===============================
+def main():
+    logging.info("🦞 实盘系统启动")
+    while True:
+        try:
+            for symbol, tokens in MARKETS.items():
+                # 示例：获取最新交易信号
+                signal = generate_signal(symbol)  # 返回 "UP" 或 "DOWN"
+                token_id = tokens.get(signal)
+                if not token_id:
+                    logging.warning(f"⚠️ {symbol} {signal} 未配置 TOKEN_ID")
+                    continue
+
+                # 执行交易
+                execute_trade(symbol, token_id, signal)
+                logging.info(f"✅ {symbol} 下单 {signal}")
+
+            time.sleep(5)  # 每 5 秒循环一次，可调
+        except Exception as e:
+            logging.error(f"❌ 系统异常: {e}")
+            send_telegram(f"❌ 系统异常: {e}")
+            time.sleep(10)
+
+# ===============================
+# 🔹 入口
+# ===============================
+if __name__ == "__main__":
+    main()
