@@ -1,130 +1,94 @@
 import time
 import requests
 import logging
-
-from trade import execute_trade
-from strategy import generate_signal
-from config import MARKETS
+from config import MARKETS, POLY_ADDRESS
 
 logging.basicConfig(level=logging.INFO)
 
-BASE = "https://clob.polymarket.com"
+# ===============================
+# Polymarket API
+# ===============================
+POSITION_URL = "https://data-api.polymarket.com/positions"
 
 # ===============================
-# 控制
+# 获取大户持仓
 # ===============================
-cooldown = {}
-COOLDOWN_TIME = 30
-
-trade_log = []
-MAX_TRADES_PER_MIN = 3
-
-
-# ===============================
-def can_trade():
-    now = time.time()
-
-    while trade_log and now - trade_log[0] > 60:
-        trade_log.pop(0)
-
-    return len(trade_log) < MAX_TRADES_PER_MIN
-
-
-def record_trade():
-    trade_log.append(time.time())
-
-
-# ===============================
-def get_trades(token_id):
+def get_positions(user):
     try:
-        url = f"{BASE}/trades?token_id={token_id}"
-        res = requests.get(url, timeout=5)
-
-        if res.status_code != 200:
-            return []
-
-        data = res.json()
-
-        # 兼容结构
-        if isinstance(data, dict):
-            data = data.get("trades", [])
-
-        if not isinstance(data, list):
-            return []
-
-        return data
-
+        params = {
+            "user": user,
+            "sizeThreshold": 0.1,
+            "limit": 50,
+            "offset": 0,
+            "sortBy": "TOKENS",
+            "sortDirection": "DESC"
+        }
+        res = requests.get(POSITION_URL, params=params, timeout=5)
+        return res.json()
     except Exception as e:
-        logging.warning(f"⚠️ trades获取失败: {e}")
+        logging.error(f"获取持仓失败: {e}")
         return []
 
+# ===============================
+# 信号生成（核心逻辑）
+# ===============================
+def generate_signal(positions):
+    signals = []
+
+    for p in positions:
+        size = float(p.get("size", 0))
+        outcome = p.get("outcome")
+        condition_id = p.get("conditionId")
+
+        # 👉 大户阈值（你可以调）
+        if size > 50:
+            signals.append({
+                "condition_id": condition_id,
+                "side": outcome,
+                "size": size
+            })
+
+    return signals
 
 # ===============================
-def main():
-    logging.info("🚀 REST 实盘稳定版启动")
+# 模拟下单（先用这个，避免真钱）
+# ===============================
+def execute_trade(signal):
+    logging.info(f"🚀 下单信号: {signal}")
+
+# ===============================
+# 主循环
+# ===============================
+def run():
+    if not POLY_ADDRESS:
+        logging.error("❌ 没有设置 POLY_ADDRESS")
+        return
+
+    logging.info("🚀 系统启动成功")
 
     while True:
         try:
-            for symbol, m in MARKETS.items():
+            positions = get_positions(POLY_ADDRESS)
 
-                now = time.time()
+            if not positions:
+                logging.warning("⚠️ 没有获取到持仓")
+                time.sleep(5)
+                continue
 
-                # 冷却
-                if symbol in cooldown and now - cooldown[symbol] < COOLDOWN_TIME:
-                    continue
+            signals = generate_signal(positions)
 
-                token_id = m["YES"]
-
-                trades = get_trades(token_id)
-
-                if not trades:
-                    continue
-
-                last = trades[-1]
-
-                try:
-                    price = float(last.get("price", 0))
-                except:
-                    continue
-
-                if price <= 0:
-                    continue
-
-                state = {
-                    "trades": trades[-50:],
-                    "last_price": price,
-                    "last_token": token_id
-                }
-
-                signal = generate_signal(state)
-
-                if not signal:
-                    continue
-
-                if not can_trade():
-                    logging.warning("⛔ 频率限制")
-                    continue
-
-                logging.info(f"🎯 {symbol} | {signal} | {price}")
-
-                execute_trade(
-                    symbol,
-                    m["YES"] if signal == "BUY" else m["NO"],
-                    signal,
-                    price,
-                    0.3   # 小仓测试
-                )
-
-                cooldown[symbol] = now
-                record_trade()
-
-            time.sleep(2)
+            if not signals:
+                logging.info("😴 无交易信号")
+            else:
+                # 👉 只选最大仓位（关键优化）
+                best = max(signals, key=lambda x: x["size"])
+                execute_trade(best)
 
         except Exception as e:
-            logging.error(f"❌ 主循环错误: {e}")
-            time.sleep(3)
+            logging.error(f"系统异常: {e}")
 
+        time.sleep(10)
 
 # ===============================
 if __name__ == "__main__":
-    main()
+    run()
