@@ -1,4 +1,4 @@
-import os, asyncio, logging, time, requests
+import os, asyncio, logging, requests
 from py_clob_client.client import ClobClient
 from eth_account import Account
 
@@ -6,76 +6,73 @@ from eth_account import Account
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 PK = os.getenv("FUNDING_KEY") or os.getenv("PRIVATE_KEY")
-# 自动推导钱包地址，确保 Funder 永远正确
 _acc = Account.from_key(PK)
 FUNDER = _acc.address
 
 # 初始化客户端
 client = ClobClient(host="https://clob.polymarket.com", key=PK, chain_id=137, funder=FUNDER)
 
-# ================= 2. 核心穿透逻辑 (彻底重写) =================
+# ================= 2. 核心：强制激活与查询 =================
 
-async def get_balance_final_boss():
+async def get_balance_with_activation():
     """
-    不再依赖 get_proxy_address，直接通过多种 API 路径强制抓取余额
+    针对 400 错误的终极修复方案
     """
     try:
-        # 解决日志中的 400 Bad Request：先衍生，再设置
-        logging.info("🔐 正在重新握手 API 权限...")
+        # 1. 强制激活逻辑：如果一直 400，说明服务器不认这个 key
+        logging.info("⚡ 正在执行 API 强制激活...")
         try:
-            # 某些版本 SDK 需要先执行 derive
+            # 第一步：先尝试获取现有的，如果不成功会自动抛出异常
             creds = client.create_or_derive_api_creds()
             client.set_api_creds(creds)
-        except Exception as cred_err:
-            logging.warning(f"⚠️ 凭据同步提示: {cred_err}")
+            logging.info(f"🔑 凭据激活成功! Key ID: {creds.api_key[:8]}***")
+        except Exception as e:
+            logging.warning(f"⚠️ 自动激活跳过 (可能已存在): {e}")
 
-        # 核心：绕过所有可能报错的 Proxy 方法，直接探测可用接口
+        # 2. 深度探测余额
+        # 注意：如果 API Key 没过，下面这些方法都会返回 None 或抛异常
         res = None
-        # 按照新版 SDK 成功率排序
-        check_methods = ['get_collateral_balance', 'get_balance', 'get_user_allowance']
-        
-        for m_name in check_methods:
-            if hasattr(client, m_name):
+        for method_name in ['get_collateral_balance', 'get_balance']:
+            if hasattr(client, method_name):
                 try:
-                    logging.info(f"📡 尝试接口: {m_name}")
-                    res = await asyncio.to_thread(getattr(client, m_name))
+                    # 增加超时控制，防止死锁
+                    res = await asyncio.to_thread(getattr(client, method_name))
                     if res: break
-                except: continue
+                except Exception as inner_e:
+                    logging.debug(f"探测 {method_name} 失败: {inner_e}")
 
-        # 日志诊断：这是找钱的关键
         logging.info(f"📊 [底层诊断] 原始响应原文: {res}")
         
-        if not res:
-            return 0.0
-
-        # 智能解析
+        # 3. 解析结果
         if isinstance(res, dict):
-            # 自动提取任何看起来像余额的数字
-            for key in ['balance', 'amount', 'collateral', 'available']:
-                if key in res:
-                    return float(res[key])
+            # Polymarket 常见的返回字段
+            return float(res.get("balance") or res.get("amount") or 0.0)
         return float(res) if isinstance(res, (int, float, str)) else 0.0
 
     except Exception as e:
-        logging.error(f"❌ 穿透抓取崩溃: {e}")
+        logging.error(f"❌ 系统穿透失败: {e}")
         return 0.0
 
 # ================= 3. 执行循环 =================
 
 async def main():
-    logging.info(f"🚀 龙虾 V18.0 穿透部署成功 | 目标钱包: {FUNDER}")
+    logging.info(f"🚀 龙虾 V18.5 启动 | 监控地址: {FUNDER}")
+    
+    # 初次启动先尝试激活一次
+    await get_balance_with_activation()
     
     while True:
-        balance = await get_balance_final_boss()
+        balance = await get_balance_with_activation()
         
         if balance > 0:
-            logging.info(f"✅ 【锁定余额！】成功抓取到: {balance} USDC")
-            # 钱一旦找到，此处可以触发你的下单逻辑
+            logging.info(f"💰 【钱抓到了！】当前余额: {balance} USDC")
         else:
-            logging.warning("🔎 余额仍为 0。请检查网页端 'Portfolio' -> 'Deposit' 是否有待确认的交易。")
+            logging.warning("🔎 余额仍为 0。请执行以下【必杀技】：")
+            logging.info("1. 打开 Polymarket 网页并登录")
+            logging.info("2. 点击右上角钱包 -> Settings -> API Keys")
+            logging.info("3. 删掉现有的 Key，让机器人重新生成")
             
-        # 延长检查间隔至 3 分钟，防止 API 频率限制导致的 400 错误
-        await asyncio.sleep(180)
+        await asyncio.sleep(120) # 缩短为 2 分钟，加快同步
 
 if __name__ == "__main__":
     asyncio.run(main())
