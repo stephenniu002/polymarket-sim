@@ -8,7 +8,7 @@ python-telegram-bot
 pydantic
 eth-account
 web3==6.11.1
-requests==2.33.1
+requests
 python-dotenv==1.2.2
 eth-account
 
