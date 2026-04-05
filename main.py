@@ -3,162 +3,136 @@ import websockets
 import json
 import logging
 import time
+import os
 
-from trade import execute_trade
+# 核心导入：确保从你修复后的 trade.py 导入
+from trade import execute_trade 
 from strategy import generate_signal
 from config import MARKETS
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 WS_URL = "wss://clob.polymarket.com/ws"
 
 # ===============================
-# Token
+# 1. 资产监控 (针对 0xd962...CB24)
 # ===============================
 WATCH_TOKENS = []
 for m in MARKETS.values():
     WATCH_TOKENS += [m["YES"], m["NO"]]
 
-# ===============================
-# 状态
-# ===============================
-markets = {}
-
-# 冷却（时间戳）
-cooldown = {}
-
-COOLDOWN_TIME = 30  # 降低冷却
-
-MAX_TRADES_PER_MIN = 3
-trade_count = []
+# 状态追踪
+markets_state = {}
+cooldowns = {}
+COOLDOWN_SECONDS = 30 
 
 # ===============================
-# 工具函数
+# 2. 核心逻辑处理
 # ===============================
-def can_trade():
+async def handle_market_event(market_id, state):
     now = time.time()
 
-    # 清理 60 秒前的记录
-    while trade_count and now - trade_count[0] > 60:
-        trade_count.pop(0)
-
-    return len(trade_count) < MAX_TRADES_PER_MIN
-
-
-def record_trade():
-    trade_count.append(time.time())
-
-
-# ===============================
-# 核心逻辑
-# ===============================
-async def handle_market(market, state):
-
-    now = time.time()
-
-    # 冷却检查（非阻塞）
-    if market in cooldown and now - cooldown[market] < COOLDOWN_TIME:
+    # 1️⃣ 冷却检查
+    if market_id in cooldowns and now - cooldowns[market_id] < COOLDOWN_SECONDS:
         return
 
-    # 信号
+    # 2️⃣ 信号生成 (基于实时 Orderbook/Trades)
     signal = generate_signal(state)
     if not signal:
         return
 
-    # 防止无价格
-    if not state["last_price"]:
+    # 3️⃣ 数据完整性检查
+    if not state.get("last_price") or not state.get("last_token"):
         return
 
-    # symbol
+    # 4️⃣ 匹配 Symbol
     symbol = None
     for k, v in MARKETS.items():
         if state["last_token"] in [v["YES"], v["NO"]]:
             symbol = k
             break
+    
+    if not symbol: return
 
-    if not symbol:
-        return
+    # 5️⃣ 强度计算 (基于最近成交密度)
+    strength = min(len(state["trades"]) / 50, 1.0)
+    
+    # 6️⃣ 执行交易 (调用 trade.py 中的函数)
+    logging.info(f"🎯 触发信号 | {symbol} | {signal} | 价格: {state['last_price']} | 强度: {strength:.2f}")
+    
+    # 锁定 0xd962 地址的资产进行下单
+    execute_trade(symbol, state["last_token"], signal, state["last_price"], strength)
 
-    # 频率限制
-    if not can_trade():
-        logging.warning("⛔ 交易频率过高，跳过")
-        return
-
-    # token
-    token_id = MARKETS[symbol]["YES"] if signal == "BUY" else MARKETS[symbol]["NO"]
-
-    price = float(state["last_price"])
-
-    # 简单强度（改进）
-    strength = min(len(state["trades"]) / 50, 1)
-
-    logging.info(f"🎯 {symbol} | {signal} | 强度: {strength:.2f} | 价格: {price}")
-
-    # 下单
-    execute_trade(symbol, token_id, signal, price, strength)
-
-    # 记录
-    cooldown[market] = now
-    record_trade()
-
+    # 7️⃣ 记录冷却
+    cooldowns[market_id] = now
 
 # ===============================
-# WS
+# 3. WebSocket 引擎
 # ===============================
-async def main():
-    logging.info("🚀 V30 Pro 启动")
+async def run_lobster_ws():
+    logging.info("🚀 龙虾火控系统 V31 Pro 启动 | 目标地址: 0xd962...CB24")
+    
+    async for ws in websockets.connect(WS_URL):
+        try:
+            # 订阅频道
+            subscribe_msg = {
+                "type": "subscribe",
+                "channels": ["trades", "orderbook"],
+                "tokens": WATCH_TOKENS
+            }
+            await ws.send(json.dumps(subscribe_msg))
+            logging.info(f"📡 已连接 Polymarket WS | 正在监听 {len(WATCH_TOKENS)} 个 Token")
 
-    async with websockets.connect(WS_URL) as ws:
-        await ws.send(json.dumps({
-            "type": "subscribe",
-            "channels": ["trades", "orderbook"],
-            "tokens": WATCH_TOKENS
-        }))
-
-        logging.info("📡 WS 已连接")
-
-        while True:
-            try:
+            while True:
                 msg = await ws.recv()
                 data = json.loads(msg)
 
-                market = data.get("market")
-                token_id = data.get("token_id")
+                m_id = data.get("market")
+                t_id = data.get("token_id")
 
-                if not market or not token_id:
-                    continue
+                if not m_id or not t_id: continue
 
-                if market not in markets:
-                    markets[market] = {
+                # 初始化市场状态
+                if m_id not in markets_state:
+                    markets_state[m_id] = {
                         "trades": [],
                         "orderbook": {"bids": [], "asks": []},
                         "last_price": None,
                         "last_token": None
                     }
 
-                state = markets[market]
+                state = markets_state[m_id]
 
-                # trades
+                # 更新数据
                 if data.get("type") == "trade":
                     state["trades"].append(data)
-
-                    if len(state["trades"]) > 50:
-                        state["trades"].pop(0)
-
+                    if len(state["trades"]) > 50: state["trades"].pop(0)
                     state["last_price"] = data.get("price")
-                    state["last_token"] = token_id
+                    state["last_token"] = t_id
 
-                # orderbook
                 elif data.get("type") == "orderbook":
                     state["orderbook"] = data
 
-                await handle_market(market, state)
+                # 触发逻辑处理
+                await handle_market_event(m_id, state)
 
-            except Exception as e:
-                logging.error(f"❌ WS错误: {e}")
-                await asyncio.sleep(2)
-
+        except websockets.ConnectionClosed:
+            logging.warning("⚠️ WS 连接断开，正在尝试重连...")
+            await asyncio.sleep(5)
+            continue
+        except Exception as e:
+            logging.error(f"❌ 运行异常: {e}")
+            await asyncio.sleep(2)
 
 # ===============================
+# 4. 启动
+# ===============================
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(run_lobster_ws())
+    except KeyboardInterrupt:
+        logging.info("🛑 系统手动停止")
