@@ -1,55 +1,64 @@
 import os, asyncio, logging
 from py_clob_client.client import ClobClient
+from py_clob_client.constants import POLYGON
 from eth_account import Account
+from web3 import Web3  # 需要在 requirements.txt 中添加 web3
 
-# ================= 1. 日志配置 =================
+# ================= 1. 配置与日志 =================
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# 获取私钥 (新钱包地址)
 PK = os.getenv("PRIVATE_KEY")
 _acc = Account.from_key(PK)
 MY_ADDRESS = _acc.address
 
-# 初始化客户端 (2026版标准初始化)
-client = ClobClient(host="https://clob.polymarket.com", key=PK, chain_id=137)
+# 标准 Polygon RPC 和 USDC 合约
+RPC_URL = "https://polygon-rpc.com"
+USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" # USDC.e
+ERC20_ABI = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
 
-# ================= 2. 2026 新版探测逻辑 =================
+w3 = Web3(Web3.HTTPProvider(RPC_URL))
+
+# 初始化客户端 (2026版 API 认证)
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    key=os.getenv("POLY_API_KEY"),
+    secret=os.getenv("POLY_SECRET"),
+    passphrase=os.getenv("POLY_PASSPHRASE"),
+    chain_id=POLYGON,
+    private_key=PK
+)
+
+# ================= 2. 2026 核心逻辑修改 =================
 
 async def latest_sync_check():
     try:
-        # A. 强制执行 L1 -> L2 鉴权推导
-        # 这一步会自动处理你之前遇到的 400 错误
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-        logging.info(f"✅ 2026 新版 API 已激活 | Key: {creds.api_key[:8]}***")
-
-        # B. 资产穿透探测 (使用 2026 最新兼容函数)
-        balance = 0.0
-        
-        # 尝试最新版本的 get_balance
+        # A. 鉴权激活 (Polymarket 内部 API 激活)
         try:
-            # 0.34.x 版本后的标准写法
-            res = await asyncio.to_thread(client.get_balance)
-            if isinstance(res, dict):
-                balance = float(res.get("balance") or 0.0)
-            else:
-                balance = float(res)
+            # 2026 版 SDK 推荐使用创建或推导
+            client.derive_api_key()
+            logging.info(f"✅ 2026 新版 API 认证完成")
         except Exception as e:
-            logging.warning(f"⚠️ get_balance 探测受阻: {e}")
+            # 如果已经激活过，这里可能会报 400，可以忽略
+            pass
 
-        # C. 自动定位 Proxy 充值地址
-        proxy = "N/A"
+        # B. 资产穿透探测 (修复 AttributeError)
+        # 针对 Polymarket Proxy 钱包，直接查询链上 USDC 余额是最稳妥的
+        balance = 0.0
+        # ！！！注意：这里填入你日志中显示的那个 Proxy 地址 ！！！
+        PROXY_WALLET = "0xD228e7d8A608a656d4DF53F5cEBAEFeF9402a07b"
+        
         try:
-            # 2026版 SDK 内部会自动维护这个属性
-            proxy = client.get_proxy()
-        except:
-            proxy = MY_ADDRESS
+            usdc_contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
+            raw_balance = usdc_contract.functions.balanceOf(Web3.to_checksum_address(PROXY_WALLET)).call()
+            balance = raw_balance / 10**6 # USDC 是 6 位小数
+        except Exception as e:
+            logging.warning(f"⚠️ 链上余额探测受阻: {e}")
 
-        return balance, proxy
+        return balance, PROXY_WALLET
 
     except Exception as e:
         logging.error(f"❌ 运行异常: {e}")
@@ -58,22 +67,32 @@ async def latest_sync_check():
 # ================= 3. 主循环 =================
 
 async def main():
-    logging.info(f"🚀 龙虾 V27.0 (2026 适配版) 启动 | 地址: {MY_ADDRESS}")
+    logging.info(f"🚀 龙虾 V27.0 (2026 修复版) 启动 | 地址: {MY_ADDRESS}")
     
+    # 首次启动先尝试同步一次 API Key
+    try:
+        client.derive_api_key()
+    except:
+        pass
+
     while True:
         balance, proxy = await latest_sync_check()
         
         if balance > 0:
             logging.info(f"💰 【资产已锁定】余额: {balance} USDC")
+            # 在这里可以触发下单逻辑: 
+            # if balance >= float(os.getenv("ORDER_SIZE")):
+            #     execute_trade()
         else:
             logging.warning(f"🔎 余额为 0。")
-            logging.info(f"💡 关键提示：新钱包必须向此 Proxy 地址充值: {proxy}")
+            logging.info(f"💡 关键提示：请向此 Proxy 地址充值 (Polygon 网络): {proxy}")
             
         logging.info("-" * 45)
+        # 每 2 分钟轮询一次
         await asyncio.sleep(120)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         logging.info("🛑 机器人停止。")
