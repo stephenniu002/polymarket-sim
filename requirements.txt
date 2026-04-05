@@ -1,4 +1,4 @@
-py-clob-client==0.34.6
+py-clob-client>=0.34.6
 websockets==12.0
 httpx==0.28.1
 asyncio
