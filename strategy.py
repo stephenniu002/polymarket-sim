@@ -1,53 +1,54 @@
-import logging
+def detect_tail(trades):
+    if len(trades) < 5:
+        return None
 
-logger = logging.getLogger("LOBSTER-STRATEGY")
+    prices = [t["price"] for t in trades[-5:]]
 
-def choose_strategy():
-    """返回当前执行策略：末日反转"""
-    return "LAST_MINUTE_REVERSAL"
+    if prices[-1] < 0.2 and prices[-1] > prices[0]:
+        return "BUY"
 
-def score_signal(data, strategy):
-    """
-    针对 5 分钟盘口的最后一分钟评分逻辑
-    逻辑：识别短期超跌/超涨，博弈最后几十秒的回调
-    """
-    try:
-        price = float(data.get("price", 0.5))
-        # 假设 data 里包含最近的价格变化数据，或者我们只看极端定价
-        # 这里是一个示例评分逻辑：
-        score = 0
-        
-        # 1. 极端定价捕捉：价格偏离 0.5 越多，反转动力可能越大（针对 50/50 初始盘）
-        if price < 0.35 or price > 0.65:
-            score += 1
-            
-        # 2. 这里可以根据你传入的 data 进一步精细化
-        # 暂时默认给一个及格分 2，确保 main.py 能够触发下单
-        score += 1 
-        
-        return score
-    except Exception as e:
-        logger.error(f"❌ 评分出错: {e}")
-        return 0
+    if prices[-1] > 0.8 and prices[-1] < prices[0]:
+        return "SELL"
 
-def calc_size(balance, strategy):
-    """
-    根据余额计算下单金额
-    建议：高频 5min 盘单次投入 5%-10% 余额
-    """
-    if balance <= 0:
-        return 0
-    
-    # 策略：单笔投入 $14 (参考你之前的截图) 或者余额的 10%
-    risk_per_trade = 14.0 
-    if balance < risk_per_trade:
-        return balance * 0.9  # 余额不足时打 90%
-        
-    return risk_per_trade
+    return None
 
-# --- 核心修复：确保这段逻辑没有多余空格 ---
-def check_rebound(distance, rebound):
-    """之前的报错位置，现在已修正缩进"""
-    if distance < 0.003 and rebound > 0.006:
-        return True
-    return False
+
+def detect_imbalance(orderbook):
+    bids = sum([b[1] for b in orderbook.get("bids", [])[:5]])
+    asks = sum([a[1] for a in orderbook.get("asks", [])[:5]])
+
+    if bids > asks * 2:
+        return "BUY"
+    if asks > bids * 2:
+        return "SELL"
+
+    return None
+
+
+def detect_whale(trades):
+    if len(trades) < 5:
+        return None
+
+    sizes = [t["size"] for t in trades[-10:]]
+    avg = sum(sizes) / len(sizes)
+
+    for t in trades[-3:]:
+        if t["size"] > avg * 5:
+            return "BUY" if t["side"] == "buy" else "SELL"
+
+    return None
+
+
+def generate_signal(state):
+    s1 = detect_tail(state["trades"])
+    s2 = detect_imbalance(state["orderbook"])
+    s3 = detect_whale(state["trades"])
+
+    signals = [s1, s2, s3]
+
+    if signals.count("BUY") >= 2:
+        return "BUY"
+    if signals.count("SELL") >= 2:
+        return "SELL"
+
+    return None
