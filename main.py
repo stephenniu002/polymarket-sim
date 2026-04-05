@@ -1,44 +1,56 @@
 import requests
 import os
 import time
+import random
 
 API_KEY = os.getenv("POLY_API_KEY")
 
 BASE = "https://clob.polymarket.com"
 
+# ⚠️ 安全开关（先不要关）
+REAL_TRADE = False
+
 
 # ===============================
-# 1️⃣ 检查 API / 余额
+# 1️⃣ 检查余额
 # ===============================
 def check_balance():
     try:
         url = f"{BASE}/positions"
         headers = {"Authorization": f"Bearer {API_KEY}"}
+
         res = requests.get(url, headers=headers, timeout=10)
 
-        print("💰 余额返回:", res.text)
+        print("💰 余额:", res.text)
 
         return res.json()
+
     except Exception as e:
         print("❌ 余额错误:", e)
         return None
 
 
 # ===============================
-# 2️⃣ 获取市场（自动找 token）
+# 2️⃣ 获取市场（更稳版本）
 # ===============================
-def get_markets():
+def get_market():
     try:
         url = f"{BASE}/markets"
         res = requests.get(url, timeout=10)
         data = res.json()
 
-        # 找第一个可交易市场
         for m in data:
-            if "tokens" in m and len(m["tokens"]) >= 2:
-                yes_token = m["tokens"][0]["token_id"]
-                no_token = m["tokens"][1]["token_id"]
+            if not m.get("active"):
+                continue
 
+            tokens = m.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+
+            yes_token = tokens[0].get("token_id")
+            no_token = tokens[1].get("token_id")
+
+            if yes_token and no_token:
                 print("🎯 市场:", m.get("question"))
                 print("YES:", yes_token)
                 print("NO :", no_token)
@@ -48,29 +60,34 @@ def get_markets():
         return None, None
 
     except Exception as e:
-        print("❌ 市场获取失败:", e)
+        print("❌ 市场错误:", e)
         return None, None
 
 
 # ===============================
-# 3️⃣ 简单策略（先能跑）
+# 3️⃣ 策略（先简单）
 # ===============================
 def get_signal():
-    import random
     r = random.random()
 
-    if r > 0.6:
+    if r > 0.65:
         return "YES"
-    elif r < 0.4:
+    elif r < 0.35:
         return "NO"
     return None
 
 
 # ===============================
-# 4️⃣ 下单（真实）
+# 4️⃣ 下单（安全版）
 # ===============================
 def place_order(token_id, side):
     try:
+        print(f"🧪 准备下单: {side} | {token_id}")
+
+        if not REAL_TRADE:
+            print("⚠️ 当前为模拟模式（未真实下单）")
+            return
+
         url = f"{BASE}/orders"
 
         payload = {
@@ -85,7 +102,7 @@ def place_order(token_id, side):
             "Content-Type": "application/json"
         }
 
-        res = requests.post(url, json=payload, headers=headers)
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
 
         print("📤 下单返回:", res.text)
 
@@ -97,7 +114,7 @@ def place_order(token_id, side):
 # 主循环
 # ===============================
 def main():
-    print("🚀 Polymarket Bot V27.2 启动")
+    print("🚀 Polymarket Bot V27.3 启动（稳定版）")
 
     while True:
         print("\n⏰ 新一轮")
@@ -105,15 +122,15 @@ def main():
         # 1️⃣ 查余额
         check_balance()
 
-        # 2️⃣ 拿市场
-        yes_token, no_token = get_markets()
+        # 2️⃣ 获取市场
+        yes_token, no_token = get_market()
 
         if not yes_token:
-            print("❌ 没找到市场")
+            print("❌ 无市场")
             time.sleep(60)
             continue
 
-        # 3️⃣ 策略
+        # 3️⃣ 信号
         signal = get_signal()
 
         if not signal:
