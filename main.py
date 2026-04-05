@@ -6,21 +6,21 @@ import time
 import os
 
 # ==========================================
-# 1. 配置文件加载 (对齐 config.py)
+# 1. 配置文件加载
 # ==========================================
 try:
     from trade import execute_trade 
     from strategy import generate_signal
     from config import MARKET_MAP, POLY_ADDRESS
-    logging.info("✅ config.py 加载成功")
+    logging.info("✅ config.py 变量对接成功")
 except ImportError:
     MARKET_MAP = {}
     POLY_ADDRESS = os.getenv("POLY_ADDRESS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ⚠️ 统一使用 v1 路径，这是目前最稳的
-WS_URL = "wss://clob.polymarket.com/ws/v1" 
+# ⚠️ 修正 404：尝试带斜杠的根路径
+WS_URL = "wss://clob.polymarket.com/ws/" 
 
 WATCH_TOKENS = []
 for m in MARKET_MAP.values():
@@ -32,7 +32,7 @@ cooldowns = {}
 COOLDOWN_SECONDS = 20 
 
 # ==========================================
-# 2. 逻辑处理器
+# 2. 核心处理器
 # ==========================================
 async def handle_market_event(m_id, t_id, data):
     now = time.time()
@@ -47,7 +47,6 @@ async def handle_market_event(m_id, t_id, data):
         state["last_price"] = data.get("price")
         state["last_token"] = t_id
         
-        # 冷却控制
         if m_id in cooldowns and now - cooldowns[m_id] < COOLDOWN_SECONDS:
             return
 
@@ -60,24 +59,23 @@ async def handle_market_event(m_id, t_id, data):
                     break
             
             strength = min(len(state["trades"]) / 30, 1.0)
-            logging.info(f"🎯 [SIGNAL] {symbol} | {signal} | 价格: {state['last_price']} | 强度: {strength:.2f}")
+            logging.info(f"🎯 [SIGNAL] {symbol} | {signal} | 价格: {state['last_price']}")
             execute_trade(symbol, t_id, signal, state["last_price"], strength)
             cooldowns[m_id] = now
 
 # ==========================================
-# 3. WebSocket 引擎 (移除 extra_headers 彻底解决报错)
+# 3. WebSocket 引擎
 # ==========================================
 async def run_lobster_ws():
     logging.info(f"🚀 龙虾系统启动 | 监听钱包: {POLY_ADDRESS}")
     
     if not WATCH_TOKENS:
-        logging.error("❌ 监听列表为空！请检查 config.py 中的 MARKET_MAP")
+        logging.error("❌ 监听列表为空！")
         return
 
     while True:
         try:
             logging.info(f"📡 正在尝试连接: {WS_URL}")
-            # 这里去掉了所有版本敏感的参数，只保留最基本的 URL
             async with websockets.connect(WS_URL) as ws:
                 logging.info("✅ WebSocket 连接成功 (101)")
                 
@@ -87,7 +85,7 @@ async def run_lobster_ws():
                     "tokens": WATCH_TOKENS
                 }
                 await ws.send(json.dumps(subscribe_msg))
-                logging.info(f"📡 订阅发送完成，监控资产数: {len(WATCH_TOKENS)}")
+                logging.info(f"📡 已订阅 {len(WATCH_TOKENS)} 个 Token")
                 
                 async for msg in ws:
                     data = json.loads(msg)
@@ -97,12 +95,11 @@ async def run_lobster_ws():
                         await handle_market_event(m_id, t_id, data)
 
         except Exception as e:
-            # 这里的 e 如果依然报 404，说明路径需要微调
-            logging.warning(f"⚠️ 连接状态异常: {e}, 5秒后重连...")
-            await asyncio.sleep(50)
+            logging.warning(f"⚠️ 连接状态: {e}, 5秒后重连...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     try:
         asyncio.run(run_lobster_ws())
     except KeyboardInterrupt:
-        logging.info("🛑 系统手动下线")
+        logging.info("🛑 停止")
