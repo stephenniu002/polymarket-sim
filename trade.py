@@ -3,35 +3,27 @@ import logging
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
+# 初始化 (不传 api_key 这种会报错的参数)
 def get_lobster_client():
-    # 极简初始化
     try:
+        # 只给 host，其余参数稍后手动注入
         c = ClobClient(host="https://clob.polymarket.com")
     except:
         c = ClobClient()
     
-    # 手动属性注入 (绕过构造函数检查)
-    c.host = "https://clob.polymarket.com"
-    c.key = os.getenv("POLY_API_KEY")
-    c.api_key = os.getenv("POLY_API_KEY")
-    c.secret = os.getenv("POLY_SECRET")
-    c.api_secret = os.getenv("POLY_SECRET")
-    c.passphrase = os.getenv("POLY_PASSPHRASE")
-    c.api_passphrase = os.getenv("POLY_PASSPHRASE")
-    c.private_key = os.getenv("PRIVATE_KEY")
+    # 暴力注入属性 (兼容所有 SDK 版本)
+    c.api_key = os.getenv("POLY_API_KEY") or os.getenv("API_KEY")
+    c.api_secret = os.getenv("POLY_SECRET") or os.getenv("API_SECRET")
+    c.api_passphrase = os.getenv("POLY_PASSPHRASE") or os.getenv("API_PASSPHRASE")
+    c.private_key = os.getenv("PRIVATE_KEY") or os.getenv("POLY_PRIVATE_KEY")
     c.chain_id = POLYGON
     return c
 
 client = get_lobster_client()
 
 def execute_trade(symbol, token_id, side, price, strength):
-    if not client:
-        logging.error("❌ 机器人尚未就绪")
-        return
+    # 这里的函数名必须叫 execute_trade，否则 main.py 会报 ImportError
     try:
-        logging.info(f"📤 [TRADE] {symbol} 信号捕获 | side: {side} | 价格: {price}")
-        # 这里可以使用你的 0xd962 地址执行下单逻辑
+        logging.info(f"📤 [TRADE] {symbol} | {side} | 价格: {price}")
     except Exception as e:
-        logging.error(f"❌ 交易执行异常: {e}")
+        logging.error(f"❌ 交易执行失败: {e}")
