@@ -3,97 +3,117 @@ import time
 import requests
 import logging
 
-logging.basicConfig(level=logging.INFO)
-
+# ===============================
+# 基础配置
+# ===============================
 BASE = "https://clob.polymarket.com"
 
-POLY_ADDRESS = os.getenv("POLY_ADDRESS")
-PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# 从环境变量读取
+TOKENS = {
+    "BTC": os.getenv("BTC_TOKEN_ID"),
+    "ETH": os.getenv("ETH_TOKEN_ID"),
+    "SOL": os.getenv("SOL_TOKEN_ID"),
+    "ARB": os.getenv("ARB_TOKEN_ID"),
+    "OP": os.getenv("OP_TOKEN_ID"),
+    "DOGE": os.getenv("DOGE_TOKEN_ID"),
+    "MATIC": os.getenv("MATIC_TOKEN_ID"),
+}
 
 # ===============================
-# 获取市场
-# ===============================
-def get_markets():
-    try:
-        url = f"{BASE}/markets"
-        res = requests.get(url, timeout=10)
-        return res.json()
-    except Exception as e:
-        logging.error(f"❌ 获取市场失败: {e}")
-        return []
-
-# ===============================
-# 筛选 BTC / ETH
-# ===============================
-def filter_markets(markets):
-    result = []
-
-    for m in markets:
-        q = m.get("question", "").upper()
-
-        if "BTC" in q or "BITCOIN" in q or "ETH" in q or "ETHEREUM" in q:
-            if m.get("active") is True:
-                result.append(m)
-
-    return result
-
-# ===============================
-# 选择最强市场（按流动性）
-# ===============================
-def pick_best_market(markets):
-    if not markets:
-        return None
-
-    # 按成交量排序（fallback 用 liquidity）
-    markets.sort(
-        key=lambda x: x.get("volume", 0) or x.get("liquidity", 0),
-        reverse=True
-    )
-
-    return markets[0]
-
-# ===============================
-# 获取 Token
-# ===============================
-def extract_tokens(market):
-    try:
-        tokens = market.get("tokens", [])
-
-        if len(tokens) < 2:
-            return None, None
-
-        yes_token = tokens[0]["token_id"]
-        no_token = tokens[1]["token_id"]
-
-        return yes_token, no_token
-
-    except:
-        return None, None
-
-# ===============================
-# 获取成交数据（判断信号）
+# 获取成交数据
 # ===============================
 def get_trades(token_id):
     try:
         url = f"{BASE}/trades?token_id={token_id}"
         res = requests.get(url, timeout=5)
-        return res.json()
-    except:
+        data = res.json()
+
+        if not isinstance(data, list):
+            return []
+
+        return data[-20:]  # 最近20笔
+    except Exception as e:
+        logging.error(f"❌ 获取 trades 失败: {e}")
         return []
 
 # ===============================
-# 简单信号（尾部动量）
+# 信号生成（核心策略）
 # ===============================
 def generate_signal(trades):
-    if not trades:
-        return None
+    buy = 0
+    sell = 0
 
-    recent = trades[-10:]
+    for t in trades:
+        side = t.get("side", "")
+        size = float(t.get("size", 0))
 
-    buy = sum(1 for t in recent if t.get("side") == "buy")
-    sell = sum(1 for t in recent if t.get("side") == "sell")
+        if side == "buy":
+            buy += size
+        elif side == "sell":
+            sell += size
 
-    if buy > sell * 1.5:
-        return "BUY"
+    # 防止除0
+    if buy == 0 and sell == 0:
+        return "HOLD"
 
+    # ===== 核心逻辑 =====
     if sell > buy * 1.5:
+        return "SELL"
+    elif buy > sell * 1.5:
+        return "BUY"
+    else:
+        return "HOLD"
+
+# ===============================
+# 模拟下单（你可以换真实API）
+# ===============================
+def execute_trade(symbol, signal):
+    if signal == "HOLD":
+        return
+
+    logging.info(f"🚀 {symbol} 信号: {signal}")
+
+    # 👉 实盘这里替换为真实下单
+    # 例如：clob_client.create_order(...)
+    # 当前先打印
+    logging.info(f"📈 模拟下单: {symbol} -> {signal}")
+
+# ===============================
+# 主循环
+# ===============================
+def run():
+    logging.info("🦞 实盘系统启动成功")
+
+    while True:
+        for symbol, token_id in TOKENS.items():
+
+            if not token_id:
+                logging.warning(f"⚠️ {symbol} 未配置 TOKEN_ID")
+                continue
+
+            trades = get_trades(token_id)
+
+            if not trades:
+                logging.warning(f"⚠️ {symbol} 无交易数据")
+                continue
+
+            signal = generate_signal(trades)
+
+            logging.info(f"{symbol} → {signal}")
+
+            execute_trade(symbol, signal)
+
+        time.sleep(10)  # 每10秒跑一轮
+
+
+# ===============================
+# 启动
+# ===============================
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception as e:
+        logging.error(f"❌ 崩溃: {e}")
+        time.sleep(5)
