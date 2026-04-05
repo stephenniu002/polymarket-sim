@@ -1,132 +1,81 @@
 import os, asyncio, logging, time, requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.signer import Signer
 from eth_account import Account
 
 # ================= 1. 基础配置 =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 PK = os.getenv("FUNDING_KEY") or os.getenv("PRIVATE_KEY")
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# 自动推导钱包地址，确保 Funder 永远正确
+_acc = Account.from_key(PK)
+FUNDER = _acc.address
 
-# 交易参数设置
-MIN_BET = 5.0        # 每次下单金额
-MAX_BET_PRICE = 0.8  # 不买胜率超过 80% 的单子 (赔率太低)
-MIN_BET_PRICE = 0.1  # 不买胜率低于 10% 的单子 (风险太大)
-
-if PK:
-    try:
-        _acc = Account.from_key(PK)
-        FUNDER = _acc.address
-        logging.info(f"✅ 钱包地址识别成功: {FUNDER}")
-    except:
-        FUNDER = os.getenv("POLY_ADDRESS")
-else:
-    FUNDER = os.getenv("POLY_ADDRESS")
-
-def send_telegram(text):
-    if not TG_TOKEN or not TG_CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT_ID, "text": f"🦞 龙虾系统报告:\n{text}", "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=10)
-    except: pass
-
-# ================= 2. 客户端初始化 =================
+# 初始化客户端
 client = ClobClient(host="https://clob.polymarket.com", key=PK, chain_id=137, funder=FUNDER)
-try:
-    client.signer = Signer(PK, chain_id=137)
-except: pass
 
-# ================= 3. 核心功能函数 =================
+# ================= 2. 核心穿透逻辑 (彻底重写) =================
 
-async def get_universal_balance():
-    """万能余额获取函数：自适应方法扫描"""
-    res = None
+async def get_balance_final_boss():
+    """
+    不再依赖 get_proxy_address，直接通过多种 API 路径强制抓取余额
+    """
     try:
-        # 强制同步凭据，防止 400 错误
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
+        # 解决日志中的 400 Bad Request：先衍生，再设置
+        logging.info("🔐 正在重新握手 API 权限...")
+        try:
+            # 某些版本 SDK 需要先执行 derive
+            creds = client.create_or_derive_api_creds()
+            client.set_api_creds(creds)
+        except Exception as cred_err:
+            logging.warning(f"⚠️ 凭据同步提示: {cred_err}")
 
-        # 方法扫描逻辑
-        for m_name in ['get_collateral_balance', 'get_balance', 'get_allowance']:
-            if hasattr(client, m_name):
-                res = await asyncio.to_thread(getattr(client, m_name))
-                if res: break
+        # 核心：绕过所有可能报错的 Proxy 方法，直接探测可用接口
+        res = None
+        # 按照新版 SDK 成功率排序
+        check_methods = ['get_collateral_balance', 'get_balance', 'get_user_allowance']
         
-        logging.info(f"📊 [调试] 余额原始响应: {res}")
+        for m_name in check_methods:
+            if hasattr(client, m_name):
+                try:
+                    logging.info(f"📡 尝试接口: {m_name}")
+                    res = await asyncio.to_thread(getattr(client, m_name))
+                    if res: break
+                except: continue
 
+        # 日志诊断：这是找钱的关键
+        logging.info(f"📊 [底层诊断] 原始响应原文: {res}")
+        
+        if not res:
+            return 0.0
+
+        # 智能解析
         if isinstance(res, dict):
-            val = res.get("balance") or res.get("amount") or res.get("collateral") or 0.0
-            return float(val)
+            # 自动提取任何看起来像余额的数字
+            for key in ['balance', 'amount', 'collateral', 'available']:
+                if key in res:
+                    return float(res[key])
         return float(res) if isinstance(res, (int, float, str)) else 0.0
+
     except Exception as e:
-        logging.error(f"❌ 余额解析失败: {e}")
+        logging.error(f"❌ 穿透抓取崩溃: {e}")
         return 0.0
 
-async def auto_market_hunter():
-    """
-    【智能下单模块】: 扫描热门市场并尝试下单
-    """
-    try:
-        # 1. 抓取 Gamma API 上的热门市场
-        url = "https://gamma-api.polymarket.com/markets"
-        params = {"limit": 5, "active": "true", "closed": "false", "order_by": "volume24h", "order_direction": "desc"}
-        resp = requests.get(url, params=params, timeout=10).json()
-        
-        for m in resp:
-            title = m.get("question")
-            token_id = m["tokens"][0]["token_id"] # 默认取第一个 Token (通常是 YES)
-            
-            # 2. 获取盘口价格
-            ob = await asyncio.to_thread(client.get_order_book, token_id)
-            if not ob.get("asks"): continue
-            
-            best_price = float(ob["asks"][0][0])
-            
-            # 3. 策略判断：价格在 0.1~0.8 之间则自动买入 5U
-            if MIN_BET_PRICE <= best_price <= MAX_BET_PRICE:
-                logging.info(f"🎯 发现机会: {title} | 价格: {best_price} | 尝试下单...")
-                
-                order_args = OrderArgs(price=best_price, size=MIN_BET, side="buy", token_id=token_id)
-                
-                def _place():
-                    signed = client.create_order(order_args)
-                    return client.post_order(signed, OrderType.GTC)
-                
-                res = await asyncio.to_thread(_place)
-                if res.get("success"):
-                    msg = f"✅ <b>自动下单成功!</b>\n市场: {title}\n成交价: {best_price}\n投入: {MIN_BET} USDC"
-                    send_telegram(msg)
-                    return True # 每次循环只下一单，稳健为主
-        return False
-    except Exception as e:
-        logging.error(f"💥 猎手模块异常: {e}")
-        return False
-
-# ================= 4. 主程序入口 =================
+# ================= 3. 执行循环 =================
 
 async def main():
-    send_telegram(f"🚀 龙虾 V17.9 启动\n监控地址: <code>{FUNDER}</code>")
+    logging.info(f"🚀 龙虾 V18.0 穿透部署成功 | 目标钱包: {FUNDER}")
     
     while True:
-        try:
-            balance = await get_universal_balance()
-            logging.info(f"💰 当前实时余额: {balance} USDC")
+        balance = await get_balance_final_boss()
+        
+        if balance > 0:
+            logging.info(f"✅ 【锁定余额！】成功抓取到: {balance} USDC")
+            # 钱一旦找到，此处可以触发你的下单逻辑
+        else:
+            logging.warning("🔎 余额仍为 0。请检查网页端 'Portfolio' -> 'Deposit' 是否有待确认的交易。")
             
-            if balance >= MIN_BET:
-                logging.info("✅ 余额充足，开始扫描市场...")
-                await auto_market_hunter()
-            else:
-                logging.warning(f"⚠️ 余额 ({balance}) 不足 {MIN_BET}U，等待充值...")
-
-            # 建议缩短检查时间，比如 5 分钟，提高抓单成功率
-            await asyncio.sleep(300) 
-        except Exception as e:
-            logging.error(f"🔄 循环异常: {e}")
-            await asyncio.sleep(60)
+        # 延长检查间隔至 3 分钟，防止 API 频率限制导致的 400 错误
+        await asyncio.sleep(180)
 
 if __name__ == "__main__":
     asyncio.run(main())
