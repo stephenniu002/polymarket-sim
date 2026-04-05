@@ -1,5 +1,5 @@
 py-clob-client==0.34.6
-websockets==11.0.3
+websockets==10.4
 httpx==0.28.1
 asyncio
 fastapi
@@ -10,4 +10,5 @@ eth-account
 web3==6.11.1
 requests==2.33.1
 python-dotenv==1.2.2
+eth-account
 
