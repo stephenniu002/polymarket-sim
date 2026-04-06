@@ -2,294 +2,149 @@ import os
 import asyncio
 import logging
 import time
-import requests
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.signer import Signer
+from typing import Dict
 
-# ================= 日志 =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logging.info("🚀 polymarket-sim: V17.2 (7币全覆盖版) 启动")
+# 假设你使用的是 py-polymarket-client 库
+# 请确保你的环境变量中已设置：PK, API_KEY, API_SECRET, API_PASSPHRASE
+from py_polymarket_client import ClobClient, OrderArgs, OrderType
 
-# ================= 环境变量 =================
-PK = os.getenv("FOX_PRIVATE_KEY")
-FUNDER = os.getenv("Funder")
-
-if not PK or not PK.startswith("0x"):
-    raise Exception("🛑 FOX_PRIVATE_KEY 未正确配置（必须0x开头）")
-
-if not FUNDER or not FUNDER.startswith("0x"):
-    raise Exception("🛑 Funder 地址未正确配置（必须0x开头）")
-
-logging.info(f"🔗 链路激活地址: {FUNDER[:10]}...")
-
-# ================= TOKEN 全覆盖 =================
-MARKETS = {
-    "BTC": {
-        "UP": "68033518322462371935856735251001652798688532944534600565715682414078422713363",
-        "DOWN": "42290470910454159474303047950885744851262714754899371843021423088168640872907"
-    },
-    "ETH": {
-        "UP": "22697677844037973694672765750606352785901003559149933535427801487665640947803",
-        "DOWN": "115090385978773385923886371350527743245393288513466835985021881253014596643630"
-    },
-    "SOL": {
-        "UP": "104603314801857341640835854350038686011870944676564680074680431702449050206849",
-        "DOWN": "109356807032619845857448714056328897846193614693799092745423146063644528271739"
-    },
-    "ARB": {
-        "UP": "83969554674239323125534841773025419295324024187242141567151123418758917736351",
-        "DOWN": "55696486755928578342776003278410729069499785313927089760850183610072430890445"
-    },
-    "OP": {
-        "UP": "102762789132004280347110241206954008153952900365785095086032215198759595021055",
-        "DOWN": "114844319908492689652356903444093235582805928777096660934420753771345312987663"
-    },
-    "DOGE": {
-        "UP": "106625082417191245995145458652026897669356408589941137585886068627196204381551",
-        "DOWN": "70904302110360626667376939927906146916424503243022738450880960377487226196037"
-    },
-    "MATIC": {
-        "UP": "113731536206314593343123440641902754070657405235286809042047205745082834474083",
-        "DOWN": "70757969820078082396704681961608768251154072300114355273498766356711024291765"
-    }
-}
-
-# ================= 客户端 =================
-client = ClobClient(
-    host="https://clob.polymarket.com",
-    key=PK,
-    chain_id=137,
-    funder=FUNDER
+# ================= 配置区 =================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-client.signer = Signer(PK, chain_id=137)
-if client.signer is None:
-    raise Exception("🛑 signer 初始化失败")
+# 示例市场 ID (请务必替换为你实际要交易的 Token ID)
+MARKETS = {
+    "BTC-High": {"UP": "21742450893073934336504295323901415510006760017135962002521191060010041285427"},
+    "ETH-High": {"UP": "11152450893073934336504295323901415510006760017135962002521191060010041285427"}
+}
 
-# ================= 初始化 =================
+# 初始化 Client (建议放在全局或通过函数获取)
+# 这里的参数根据你的库版本可能需要微调
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    private_key=os.getenv("PK"),
+    api_key=os.getenv("API_KEY"),
+    api_secret=os.getenv("API_SECRET"),
+    api_passphrase=os.getenv("API_PASSPHRASE")
+)
+
+# ================= 初始化引擎 =================
 def init_engine():
     try:
         logging.info("🔧 V17.2 启动：标准初始化模式...")
+        # 获取或验证 API 凭据
         creds = client.create_or_derive_api_creds()
         client.set_api_creds(creds)
+        
         try:
+            # 必须步骤：授权 L2 允许使用 USDC
             client.update_balance_allowance()
         except Exception as e:
-            logging.warning(f"⚠️ Allowance 跳过: {e}")
+            logging.warning(f"⚠️ Allowance 跳过或已存在: {e}")
+            
         logging.info("✅ 引擎初始化完成，交易链路已打通")
         return True
     except Exception as e:
         logging.error(f"❌ 引擎初始化失败: {e}")
         return False
 
-# ================= 余额 =================
+# ================= 获取余额 =================
 async def get_balance():
     try:
+        # Polymarket SDK 的 get_balance 通常需要地址，或从 client 内部获取
+        # 使用 to_thread 避免阻塞事件循环
         res = await asyncio.to_thread(client.get_balance)
-        return float(res.get("balance", 0))
+        
+        # 兼容处理：有些版本返回字典 {'balance': '10.5'}, 有些直接返回数字
+        if isinstance(res, dict):
+            return float(res.get("balance", 0))
+        return float(res) if res else 0.0
     except Exception as e:
         logging.error(f"❌ 余额获取失败: {e}")
-        return 0
+        return 0.0
 
-# ================= 价格 & 下单 =================
-def get_price(token):
+# ================= 获取价格 =================
+def get_price(token_id):
     try:
-        ob = client.get_order_book(token)
-        bids, asks = ob.get("bids", []), ob.get("asks", [])
+        ob = client.get_order_book(token_id)
+        bids = ob.bids if hasattr(ob, 'bids') else ob.get("bids", [])
+        asks = ob.asks if hasattr(ob, 'asks') else ob.get("asks", [])
+        
         if not bids or not asks:
-            return 0.2
-        return round((float(bids[0][0]) + float(asks[0][0])) / 2, 3)
-    except:
-        return 0.2
+            return 0.5  # 默认中间价
+            
+        # 取买一和卖一的均价
+        bid_price = float(bids[0].price if hasattr(bids[0], 'price') else bids[0][0])
+        ask_price = float(asks[0].price if hasattr(asks[0], 'price') else asks[0][0])
+        return round((bid_price + ask_price) / 2, 3)
+    except Exception:
+        return 0.5
 
+# ================= 执行下单 =================
 async def execute(token, name, balance):
     try:
-        size = max(0.1, round(balance * 0.1, 2))
+        # 策略：每次使用余额的 10%，最小 1 USDC
+        size = max(1.0, round(balance * 0.1, 2))
         price = get_price(token)
-        order = OrderArgs(price=price, size=size, side="buy", token_id=str(token))
-        def _do():
-            signed = client.create_order(order)
-            return client.post_order(signed, OrderType.GTC)
-        res = await asyncio.to_thread(_do)
-        if res and res.get("success"):
-            logging.info(f"🎯 【交易成功】{name} | {size}")
-        else:
-            logging.warning(f"❌ 【下单失败】{res}")
-    except Exception as e:
-        logging.error(f"❌ 交易异常: {e}")
+        
+        logging.info(f"🔍 尝试下单: {name} | 价格: {price} | 数量: {size}")
+        
+        order = OrderArgs(
+            price=price,
+            size=size,
+            side="BUY", 
+            token_id=str(token)
+        )
+        
+        def _do_post():
+            signed_order = client.create_order(order)
+            return client.post_order(signed_order)
 
-# ================= 主循环 =================
+        res = await asyncio.to_thread(_do_post)
+        
+        # 检查返回结果是否包含成功标识
+        if res and isinstance(res, dict) and (res.get("success") or res.get("status") == "OK"):
+            logging.info(f"🎯 【交易成功】{name} | 订单ID: {res.get('orderID')}")
+        else:
+            logging.warning(f"❌ 【下单拒绝】API 返回: {res}")
+            
+    except Exception as e:
+        logging.error(f"❌ 交易执行异常: {e}")
+
+# ================= 核心循环 =================
 async def step():
     balance = await get_balance()
-    if balance <= 0:
-        logging.warning("💰 余额异常")
+    logging.info(f"💰 当前账户余额: {balance} USDC")
+    
+    if balance < 1.0:
+        logging.warning("⚠️ 余额不足 1 USDC，无法执行策略")
         return
-    logging.info(f"💰 账户余额: {balance}")
 
     for coin, tokens in MARKETS.items():
-        token = tokens["UP"]  # 这里示例只下多单，你可以根据策略改 UP/DOWN
-        await execute(token, coin, balance)
+        token_id = tokens["UP"]
+        await execute(token_id, coin, balance)
+        # 短暂休眠防止频率限制
+        await asyncio.sleep(1)
 
 async def main():
     if not init_engine():
         logging.critical("🛑 初始化失败，程序退出")
         return
+        
     while True:
         try:
             await step()
-            await asyncio.sleep(300)  # 每5分钟循环
+            logging.info("💤 等待 5 分钟进行下一次轮询...")
+            await asyncio.sleep(300) 
         except Exception as e:
-            logging.error(f"💥 系统异常: {e}")
-            await asyncio.sleep(5)
+            logging.error(f"💥 系统循环异常: {e}")
+            await asyncio.sleep(10)
 
-# ================= 正确入口 =================
+# ================= 程序入口 =================
 if __name__ == "__main__":
-    asyncio.run(main())import os
-import asyncio
-import logging
-import time
-import requests
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.signer import Signer
-
-# ================= 日志 =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logging.info("🚀 polymarket-sim: V17.2 (7币全覆盖版) 启动")
-
-# ================= 环境变量 =================
-PK = os.getenv("FOX_PRIVATE_KEY")
-FUNDER = os.getenv("Funder")
-
-if not PK or not PK.startswith("0x"):
-    raise Exception("🛑 FOX_PRIVATE_KEY 未正确配置（必须0x开头）")
-
-if not FUNDER or not FUNDER.startswith("0x"):
-    raise Exception("🛑 Funder 地址未正确配置（必须0x开头）")
-
-logging.info(f"🔗 链路激活地址: {FUNDER[:10]}...")
-
-# ================= TOKEN 全覆盖 =================
-MARKETS = {
-    "BTC": {
-        "UP": "68033518322462371935856735251001652798688532944534600565715682414078422713363",
-        "DOWN": "42290470910454159474303047950885744851262714754899371843021423088168640872907"
-    },
-    "ETH": {
-        "UP": "22697677844037973694672765750606352785901003559149933535427801487665640947803",
-        "DOWN": "115090385978773385923886371350527743245393288513466835985021881253014596643630"
-    },
-    "SOL": {
-        "UP": "104603314801857341640835854350038686011870944676564680074680431702449050206849",
-        "DOWN": "109356807032619845857448714056328897846193614693799092745423146063644528271739"
-    },
-    "ARB": {
-        "UP": "83969554674239323125534841773025419295324024187242141567151123418758917736351",
-        "DOWN": "55696486755928578342776003278410729069499785313927089760850183610072430890445"
-    },
-    "OP": {
-        "UP": "102762789132004280347110241206954008153952900365785095086032215198759595021055",
-        "DOWN": "114844319908492689652356903444093235582805928777096660934420753771345312987663"
-    },
-    "DOGE": {
-        "UP": "106625082417191245995145458652026897669356408589941137585886068627196204381551",
-        "DOWN": "70904302110360626667376939927906146916424503243022738450880960377487226196037"
-    },
-    "MATIC": {
-        "UP": "113731536206314593343123440641902754070657405235286809042047205745082834474083",
-        "DOWN": "70757969820078082396704681961608768251154072300114355273498766356711024291765"
-    }
-}
-
-# ================= 客户端 =================
-client = ClobClient(
-    host="https://clob.polymarket.com",
-    key=PK,
-    chain_id=137,
-    funder=FUNDER
-)
-
-client.signer = Signer(PK, chain_id=137)
-if client.signer is None:
-    raise Exception("🛑 signer 初始化失败")
-
-# ================= 初始化 =================
-def init_engine():
     try:
-        logging.info("🔧 V17.2 启动：标准初始化模式...")
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-        try:
-            client.update_balance_allowance()
-        except Exception as e:
-            logging.warning(f"⚠️ Allowance 跳过: {e}")
-        logging.info("✅ 引擎初始化完成，交易链路已打通")
-        return True
-    except Exception as e:
-        logging.error(f"❌ 引擎初始化失败: {e}")
-        return False
-
-# ================= 余额 =================
-async def get_balance():
-    try:
-        res = await asyncio.to_thread(client.get_balance)
-        return float(res.get("balance", 0))
-    except Exception as e:
-        logging.error(f"❌ 余额获取失败: {e}")
-        return 0
-
-# ================= 价格 & 下单 =================
-def get_price(token):
-    try:
-        ob = client.get_order_book(token)
-        bids, asks = ob.get("bids", []), ob.get("asks", [])
-        if not bids or not asks:
-            return 0.2
-        return round((float(bids[0][0]) + float(asks[0][0])) / 2, 3)
-    except:
-        return 0.2
-
-async def execute(token, name, balance):
-    try:
-        size = max(0.1, round(balance * 0.1, 2))
-        price = get_price(token)
-        order = OrderArgs(price=price, size=size, side="buy", token_id=str(token))
-        def _do():
-            signed = client.create_order(order)
-            return client.post_order(signed, OrderType.GTC)
-        res = await asyncio.to_thread(_do)
-        if res and res.get("success"):
-            logging.info(f"🎯 【交易成功】{name} | {size}")
-        else:
-            logging.warning(f"❌ 【下单失败】{res}")
-    except Exception as e:
-        logging.error(f"❌ 交易异常: {e}")
-
-# ================= 主循环 =================
-async def step():
-    balance = await get_balance()
-    if balance <= 0:
-        logging.warning("💰 余额异常")
-        return
-    logging.info(f"💰 账户余额: {balance}")
-
-    for coin, tokens in MARKETS.items():
-        token = tokens["UP"]  # 这里示例只下多单，你可以根据策略改 UP/DOWN
-        await execute(token, coin, balance)
-
-async def main():
-    if not init_engine():
-        logging.critical("🛑 初始化失败，程序退出")
-        return
-    while True:
-        try:
-            await step()
-            await asyncio.sleep(300)  # 每5分钟循环
-        except Exception as e:
-            logging.error(f"💥 系统异常: {e}")
-            await asyncio.sleep(5)
-
-# ================= 正确入口 =================
-if __name__ == "__main__":
-    asyncio.run(main())
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("👋 程序由用户手动关闭")
