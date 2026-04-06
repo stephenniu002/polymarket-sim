@@ -1,109 +1,86 @@
-import asyncio
-import json
-import websockets
-import time
-import hmac
-import hashlib
-import requests
 import os
+import asyncio
+import requests
+import time
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
 
-# ================== 配置 ==================
-POLY_ADDRESS = os.getenv("POLY_ADDRESS")
-PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY")
-MARKET_ID = "BTC-5min"
-USDC_AMOUNT = 10
-ORDER_STEP = 0.01
-ORDER_SIZE = 1
-FEE_RATE_BPS = 156
-WS_URL = "wss://clob.polymarket.com/ws/"  # 注意末尾斜杠
-BALANCE_INTERVAL = 300
+# ================== 配置 (从环境变量读取) ==================
+# 建议在 Railway 设置：MARKET_ID 为具体的 Token ID (例如 BTC 高低预测的 ID)
+MARKET_ID = os.getenv("MARKET_ID", "21695712644755057531586361132660542317170423138438635199041119103045656331264")
+ORDER_STEP = 0.002  # 阶梯间距
+ORDER_SIZE = 1.0    # 每单 1 USDC
+SCAN_INTERVAL = 3   # 3秒扫描一次，避开 WS 404 烦恼
 
-# ================== 获取余额 ==================
-def get_balance():
-    try:
-        url = f"https://clob.polymarket.com/api/v1/accounts/{POLY_ADDRESS}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            usdc_balance = float(data.get("USDC", 0))
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] USDC余额: {usdc_balance:.2f}")
-            return usdc_balance
-        else:
-            print(f"获取余额失败: {response.status_code}, {response.text}")
-            return 0
-    except Exception as e:
-        print(f"获取余额异常: {e}")
-        return 0
+# ================== 核心逻辑 ==================
+async def lobster_logic():
+    # 初始化官方 Client
+    client = ClobClient(
+        host="https://clob.polymarket.com", 
+        key=os.getenv("POLY_PRIVATE_KEY"), 
+        chain_id=137
+    )
+    client.set_api_creds(ApiCreds(
+        api_key=os.getenv("POLY_API_KEY"),
+        api_secret=os.getenv("POLY_SECRET"),
+        api_passphrase=os.getenv("POLY_PASSPHRASE")
+    ))
 
-# ================== 阶梯挂单 ==================
-async def market_maker(bid_price, ask_price):
-    buy_prices = [round(bid_price - ORDER_STEP * i, 4) for i in range(3)]
-    sell_prices = [round(ask_price + ORDER_STEP * i, 4) for i in range(3)]
+    print(f"🚀 Lobster 阶梯挂单版启动 | 目标市场 ID: {MARKET_ID[:15]}...")
 
-    for price in buy_prices:
-        await place_order("buy", price, ORDER_SIZE)
-    for price in sell_prices:
-        await place_order("sell", price, ORDER_SIZE)
-
-# ================== 下单函数 ==================
-async def place_order(side, price, size):
-    timestamp = int(time.time() * 1000)
-    order_payload = {
-        "marketId": MARKET_ID,
-        "side": side,
-        "price": price,
-        "size": size,
-        "feeRateBps": FEE_RATE_BPS,
-        "timestamp": timestamp
-    }
-    message = f"{MARKET_ID}{side}{price}{size}{timestamp}".encode()
-    signature = hmac.new(PRIVATE_KEY.encode(), message, hashlib.sha256).hexdigest()
-    order_payload["signature"] = signature
-
-    url = f"https://clob.polymarket.com/api/v1/orders"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {POLY_ADDRESS}"}
-
-    try:
-        response = requests.post(url, headers=headers, json=order_payload, timeout=5)
-        print(f"{side.upper()} {price}x{size} -> {response.status_code}")
-    except Exception as e:
-        print(f"下单异常: {e}")
-
-# ================== WebSocket 数据订阅 ==================
-async def subscribe_market():
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                subscribe_msg = {"type": "subscribe", "marketId": MARKET_ID}
-                await ws.send(json.dumps(subscribe_msg))
-                print(f"✅ 已订阅 {MARKET_ID} 市场")
+            # 1. 获取盘口 (代替不稳定的 WebSocket)
+            book = client.get_orderbook(MARKET_ID)
+            bids = book.bids if hasattr(book, 'bids') else []
+            asks = book.asks if hasattr(book, 'asks') else []
 
-                async for message in ws:
-                    data = json.loads(message)
-                    if "bestBid" in data and "bestAsk" in data:
-                        bid = data["bestBid"]
-                        ask = data["bestAsk"]
-                        await market_maker(bid, ask)
+            if not bids or not asks:
+                print("⏳ 盘口深度不足，跳过此轮...")
+                await asyncio.sleep(5)
+                continue
 
-        except websockets.exceptions.ConnectionClosed as e:
-            print(f"⚠️ WebSocket 断开，重连中: {e}")
-            await asyncio.sleep(5)
+            best_bid = float(bids[0].price)
+            best_ask = float(asks[0].price)
+            print(f"📊 盘口更新: Bid {best_bid} | Ask {best_ask}")
+
+            # 2. 计算阶梯价格 (简单做市逻辑)
+            # 我们在买一价下方一点买入，卖一价上方一点卖出
+            buy_price = round(best_bid - 0.001, 3)
+            sell_price = round(best_ask + 0.001, 3)
+
+            # 3. 执行下单 (使用官方签名逻辑)
+            # 注意：此处仅作演示，实盘中建议先 cancel_all 再下单
+            try:
+                # 尝试挂一个买单
+                client.post_order({
+                    "price": buy_price,
+                    "size": ORDER_SIZE,
+                    "side": "BUY",
+                    "token_id": MARKET_ID
+                })
+                print(f"✅ 挂出买单: {buy_price}")
+            except Exception as e:
+                if "insufficient" in str(e).lower():
+                    print("💰 资金已占用，等待成交...")
+                else:
+                    print(f"❌ 下单失败: {e}")
+
+            await asyncio.sleep(SCAN_INTERVAL)
+
         except Exception as e:
-            print(f"⚠️ WebSocket 异常: {e}")
-            await asyncio.sleep(5)
+            print(f"💥 循环异常: {e}")
+            await asyncio.sleep(10)
 
-# ================== 定时汇报余额 ==================
-async def balance_reporter():
-    while True:
-        get_balance()
-        await asyncio.sleep(BALANCE_INTERVAL)
+# ================== 余额监控 ==================
+def report_balance():
+    # 官方推荐的余额获取方式是通过 Web3 或者查询 Proxy 地址
+    # 这里简化处理，你可以通过 client 获取
+    print(f"⏰ [{time.strftime('%H:%M:%S')}] 机器人运行中，监控盘口数据...")
 
-# ================== 主循环 ==================
 async def main():
-    await asyncio.gather(
-        subscribe_market(),
-        balance_reporter()
-    )
+    # 启动主逻辑
+    await lobster_logic()
 
 if __name__ == "__main__":
     asyncio.run(main())
