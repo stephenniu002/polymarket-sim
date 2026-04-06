@@ -4,115 +4,131 @@ import requests
 import logging
 import sys
 from web3 import Web3
-
-# ✅ 兼容 Web3 V5 和 V6+ 的中间件导入
-try:
-    from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
-except ImportError:
-    try:
-        from web3.middleware import geth_poa_middleware
-    except ImportError:
-        # 最后的兜底方案：如果都找不到，定义一个空类防止程序崩溃
-        geth_poa_middleware = None
-
+from web3.middleware.geth_poa import geth_poa_middleware
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
-# ================= 1. 日志与通知配置 =================
+# ================= 日志 =================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("LOBSTER-ULTIMATE")
+logger = logging.getLogger("Lobster-Pro")
 
+# ================= Telegram =================
 def send_tg(msg):
     token = os.getenv("TG_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if token and chat_id:
         try:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            requests.post(url, json={"chat_id": chat_id, "text": f"🦞 [实盘状态]\n{msg}"}, timeout=5)
-        except: pass
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": f"🦞 {msg}"},
+                timeout=5
+            )
+        except:
+            pass
 
-# ================= 2. 链上连接与余额校验 =================
+# ================= RPC（多节点容错） =================
 RPCS = [
     "https://rpc.ankr.com/polygon",
     "https://polygon.llamarpc.com",
-    "https://1rpc.io/matic"
+    "https://polygon.publicnode.com"
 ]
 
 def get_w3():
     for rpc in RPCS:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 5}))
+            w3.middleware_onion.inject(geth_poa_middleware, layer=0)
             if w3.is_connected():
-                # ✅ 关键：只有在 Polygon 上才注入 PoA 中间件
-                if geth_poa_middleware:
-                    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                logger.info(f"✅ RPC连接成功: {rpc}")
                 return w3
-        except: continue
-    return None
+        except:
+            continue
+    raise Exception("❌ 所有 RPC 连接失败")
 
-def check_balance(w3):
+# ================= 链上余额 =================
+USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+ERC20_ABI = [{
+    "constant": True,
+    "inputs": [{"name": "_owner","type": "address"}],
+    "name": "balanceOf",
+    "outputs": [{"name": "balance","type": "uint256"}],
+    "type": "function"
+}]
+
+def get_balance(w3):
     try:
         addr = Web3.to_checksum_address(os.getenv("POLY_ADDRESS"))
-        # USDC.e 合约地址 (Polygon)
-        usdc_contract = w3.eth.contract(
-            address=Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
-            abi=[{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
-        )
+        contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=ERC20_ABI)
+
         matic = w3.eth.get_balance(addr) / 1e18
-        usdc = usdc_contract.functions.balanceOf(addr).call() / 1e6
+        usdc = contract.functions.balanceOf(addr).call() / 1e6
+
+        logger.info(f"📊 余额: {usdc:.2f} USDC | {matic:.4f} MATIC")
         return usdc, matic
     except Exception as e:
-        logger.error(f"❌ 余额读取失败: {e}")
-        return 0.0, 0.0
+        logger.error(f"余额读取失败: {e}")
+        return 0, 0
 
-# ================= 3. 盘口数据抓取 =================
-def get_best_ask(token_id):
-    """获取真实卖一价，即当前吃单成本"""
+# ================= 市场 =================
+BASE = "https://clob.polymarket.com"
+
+def get_markets():
     try:
-        url = f"https://clob.polymarket.com/book?token_id={token_id}"
-        r = requests.get(url, timeout=5).json()
-        if r.get('asks') and len(r['asks']) > 0:
-            return float(r['asks'][0]['price'])
-        return 1.0 
+        r = requests.get(f"{BASE}/sampling-markets", timeout=10).json()
+        data = r if isinstance(r, list) else r.get("data", [])
+        return [m for m in data if "tokens" in m][:10]
     except:
-        return 1.0
+        return []
 
-# ================= 4. 核心套利执行 =================
-async def run_arbitrage(client, y_id, n_id, y_ask, n_ask, size):
+def get_book(token_id):
     try:
-        logger.info(f"🔥 触发对冲! 成本: {y_ask + n_ask:.3f}")
-        
-        # 同时下达两个买单
-        tasks = [
-            asyncio.to_thread(client.post_order, {"price": round(y_ask + 0.003, 3), "size": size, "side": "BUY", "token_id": y_id}),
-            asyncio.to_thread(client.post_order, {"price": round(n_ask + 0.003, 3), "size": size, "side": "BUY", "token_id": n_id})
-        ]
-        
-        responses = await asyncio.gather(*tasks)
-        
-        success_count = sum(1 for resp in responses if resp.get("success") or resp.get("status") == "OK")
-        
-        if success_count == 2:
-            msg = f"✅ 对冲成功!\n成本: {y_ask + n_ask:.3f}\n预计结算利润: {1 - (y_ask+n_ask):.3f}"
-            send_tg(msg)
-        elif success_count == 1:
-            send_tg(f"⚠️ 严重警告: 单边成交! 请立即检查账户防止裸奔。")
-        else:
-            logger.warning(f"❌ 下单均被拒绝: {responses}")
-            
-    except Exception as e:
-        logger.error(f"💥 执行异常: {e}")
+        r = requests.get(f"{BASE}/book?token_id={token_id}", timeout=5).json()
+        bids = r.get("bids", [])
+        asks = r.get("asks", [])
 
-# ================= 5. 主循环 =================
+        best_bid = float(bids[0]["price"]) if bids else 0
+        best_ask = float(asks[0]["price"]) if asks else 1
+
+        return best_bid, best_ask
+    except:
+        return 0, 1
+
+# ================= 风控 =================
+def calc_size(usdc):
+    size = usdc * 0.1
+    return max(1, min(size, 10))
+
+def safe_order(client, order):
+    try:
+        res = client.post_order(order)
+        if not res:
+            return False
+        return True
+    except:
+        return False
+
+# ================= 主逻辑 =================
 async def main():
-    logger.info("🚀 Lobster-Elite 系统启动 (已应用 Web3 V6 兼容性补丁)")
-    
-    # 初始化账户
-    client = ClobClient(host="https://clob.polymarket.com", key=os.getenv("PRIVATE_KEY"), chain_id=137)
+    logger.info("🚀 实盘系统启动")
+
+    w3 = get_w3()
+    usdc, matic = get_balance(w3)
+
+    if matic < 0.1:
+        send_tg("❌ MATIC不足，无法交易")
+        return
+
+    client = ClobClient(
+        host=BASE,
+        key=os.getenv("PRIVATE_KEY"),
+        chain_id=137
+    )
+
     client.set_api_creds(ApiCreds(
         api_key=os.getenv("POLY_API_KEY"),
         api_secret=os.getenv("POLY_SECRET"),
@@ -121,52 +137,53 @@ async def main():
 
     while True:
         try:
-            # 1. 资产探测
-            w3 = get_w3()
-            if not w3:
-                logger.error("❌ RPC 连接失败，10秒后重试...")
-                await asyncio.sleep(10)
-                continue
-                
-            usdc, matic = check_balance(w3)
-            logger.info(f"📊 钱包状态: {usdc:.2f} USDC.e | {matic:.4f} MATIC")
-            
-            # 2. 市场扫描 (获取最新活跃交易对)
-            resp = requests.get("https://clob.polymarket.com/sampling-markets", timeout=10).json()
-            markets = resp if isinstance(resp, list) else resp.get("data", [])
-            
-            for m in markets[:12]: # 深度扫描前12个市场
-                try:
-                    tokens = m.get("tokens", [])
-                    if len(tokens) < 2: continue
-                    
-                    y_id, n_id = tokens[0]["token_id"], tokens[1]["token_id"]
-                    q_text = m.get("question", "未知")
+            markets = get_markets()
+            logger.info(f"🔎 扫描市场: {len(markets)}")
 
-                    # 3. 盘口成本分析
-                    y_ask = get_best_ask(y_id)
-                    n_ask = get_best_ask(n_id)
-                    total_cost = y_ask + n_ask
+            for m in markets:
+                q = m.get("question", "")
+                y = m["tokens"][0]["token_id"]
+                n = m["tokens"][1]["token_id"]
 
-                    # 4. 套利逻辑触发 (设定 3.5% 的安全边际)
-                    if 0.1 < total_cost < 0.965:
-                        logger.info(f"💎 发现机会: {q_text[:20]} | 合计成本: {total_cost:.3f}")
-                        
-                        order_size = float(os.getenv("ORDER_SIZE", "5.0"))
-                        if usdc < (order_size * 2):
-                            logger.warning(f"余额不足，跳过本次执行")
-                            continue
-                            
-                        await run_arbitrage(client, y_id, n_id, y_ask, n_ask, order_size)
-                        await asyncio.sleep(3) # 防止下单过快
+                y_bid, y_ask = get_book(y)
+                n_bid, n_ask = get_book(n)
 
-                except Exception: continue
+                total = y_ask + n_ask
 
-            await asyncio.sleep(20) # 扫描频率控制
+                if 0.1 < total < 0.97:
+                    logger.info(f"🔥 套利机会: {q[:20]} | {total:.3f}")
+
+                    size = calc_size(usdc)
+
+                    ok1 = safe_order(client, {
+                        "price": round(y_ask, 3),
+                        "size": size,
+                        "side": "BUY",
+                        "token_id": y
+                    })
+
+                    ok2 = safe_order(client, {
+                        "price": round(n_ask, 3),
+                        "size": size,
+                        "side": "BUY",
+                        "token_id": n
+                    })
+
+                    if ok1 and ok2:
+                        send_tg(f"✅ 套利成功 {total:.3f} | {size}")
+                    else:
+                        logger.warning("❌ 对冲失败")
+
+                await asyncio.sleep(0.3)
+
+            usdc, matic = get_balance(w3)
+            await asyncio.sleep(20)
 
         except Exception as e:
-            logger.error(f"💥 系统循环异常: {e}")
-            await asyncio.sleep(10)
+            logger.error(f"循环错误: {e}")
+            await asyncio.sleep(5)
 
+# ================= 启动 =================
 if __name__ == "__main__":
     asyncio.run(main())
+
