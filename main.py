@@ -6,68 +6,146 @@ logging.basicConfig(level=logging.INFO)
 
 BASE = "https://clob.polymarket.com"
 
-# ===== 示例市场（换成真实 token_id）=====
-MARKETS = {
-    "BTC": {"YES": "yes_id_btc", "NO": "no_id_btc"},
-    "ETH": {"YES": "yes_id_eth", "NO": "no_id_eth"},
-}
-
-EDGE_THRESHOLD = 0.01
-
-# ===== 获取盘口 =====
-def get_price(token_id):
+# ==============================
+# 获取当前可交易市场
+# ==============================
+def get_active_market():
     try:
-        url = f"{BASE}/book?token_id={token_id}"
-        res = requests.get(url, timeout=5).json()
+        res = requests.get(f"{BASE}/markets", timeout=5)
+        data = res.json()
 
-        ask = float(res["asks"][0]["price"]) if res["asks"] else None
-        bid = float(res["bids"][0]["price"]) if res["bids"] else None
+        for m in data:
+            if (
+                m.get("seriesSlug") == "eth-up-or-down-5m"
+                and m.get("acceptingOrders") == True
+                and m.get("active") == True
+                and m.get("closed") == False
+            ):
+                token_ids = eval(m["clobTokenIds"])
+                return {
+                    "name": m["question"],
+                    "up": token_ids[0],
+                    "down": token_ids[1],
+                }
 
-        return ask, bid
+        return None
     except Exception as e:
-        logging.warning(f"获取价格失败: {e}")
+        logging.error(f"获取市场失败: {e}")
+        return None
+
+
+# ==============================
+# 获取 orderbook
+# ==============================
+def get_orderbook(token_id):
+    try:
+        url = f"{BASE}/orderbook/{token_id}"
+        res = requests.get(url, timeout=5)
+        return res.json()
+    except:
+        return {}
+
+
+# ==============================
+# 获取价格
+# ==============================
+def get_price(orderbook):
+    try:
+        asks = orderbook.get("asks", [])
+        bids = orderbook.get("bids", [])
+
+        best_ask = float(asks[0]["price"]) if asks else None
+        best_bid = float(bids[0]["price"]) if bids else None
+
+        return best_bid, best_ask
+    except:
         return None, None
 
-# ===== Edge =====
-def calc_edge(y, n):
-    if not y or not n:
-        return None
-    
-    total = y + n
-    
-    # 防止你之前那个 -100% bug
-    if total > 1.2 or total < 0.8:
+
+# ==============================
+# 策略（套利 / 对冲）
+# ==============================
+def strategy(up_bid, up_ask, down_bid, down_ask):
+    try:
+        if not all([up_ask, down_ask]):
+            return None
+
+        total = up_ask + down_ask
+
+        # 套利机会
+        if total < 0.98:
+            return "ARB"
+
+        # 正常对冲策略
+        if up_ask < 0.4:
+            return "BUY_UP"
+
+        if down_ask < 0.4:
+            return "BUY_DOWN"
+
         return None
 
-    return 1 - total
+    except:
+        return None
 
-# ===== 主循环 =====
+
+# ==============================
+# 下单（你自己接入签名）
+# ==============================
+def execute(action, market):
+    logging.info(f"🚀 执行动作: {action} | {market['name']}")
+
+
+# ==============================
+# 主循环
+# ==============================
 def main():
-    logging.info("🚀 程序启动成功（稳定版）")
+    logging.info("🚀 实盘自动交易系统启动")
+
+    current_market = None
 
     while True:
         try:
-            for m, t in MARKETS.items():
-                y_ask, _ = get_price(t["YES"])
-                n_ask, _ = get_price(t["NO"])
+            market = get_active_market()
 
-                edge = calc_edge(y_ask, n_ask)
+            if not market:
+                logging.info("⏳ 等待新市场...")
+                time.sleep(5)
+                continue
 
-                if edge is None:
-                    continue
+            # 市场切换检测
+            if current_market != market["up"]:
+                logging.info(f"🔄 新市场: {market['name']}")
+                current_market = market["up"]
 
-                logging.info(
-                    f"🔍 {m} YES:{y_ask:.3f} NO:{n_ask:.3f} Edge:{edge:.2%}"
-                )
+            up_ob = get_orderbook(market["up"])
+            down_ob = get_orderbook(market["down"])
 
-                if edge > EDGE_THRESHOLD:
-                    logging.info(f"💰 套利触发 {m}")
+            up_bid, up_ask = get_price(up_ob)
+            down_bid, down_ask = get_price(down_ob)
 
-            time.sleep(5)
+            # 防止空数据
+            if not all([up_ask, down_ask]):
+                logging.warning("⚠️ 无流动性，跳过")
+                time.sleep(2)
+                continue
+
+            action = strategy(up_bid, up_ask, down_bid, down_ask)
+
+            if action:
+                execute(action, market)
+
+            # 打印监控
+            logging.info(
+                f"UP: {up_bid}/{up_ask} | DOWN: {down_bid}/{down_ask}"
+            )
+
+            time.sleep(2)
 
         except Exception as e:
             logging.error(f"❌ 主循环错误: {e}")
             time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
