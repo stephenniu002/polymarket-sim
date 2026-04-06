@@ -1,102 +1,147 @@
 import os
 import asyncio
-import logging
 import requests
+import logging
 import sys
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
-# ================= 1. 日志与通知 =================
+# ================= 日志 =================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
+# ================= TG 通知 =================
 def send_tg(msg):
     token = os.getenv("TG_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if token and chat_id:
         try:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            requests.post(url, json={"chat_id": chat_id, "text": f"🤖 [Polymarket-Sim]\n{msg}"}, timeout=5)
-        except: pass
+            requests.post(url, json={"chat_id": chat_id, "text": msg}, timeout=5)
+        except:
+            pass
 
-# ================= 2. 核心功能 =================
+# ================= 获取价格 =================
+def get_price(token_id):
+    try:
+        url = f"https://clob.polymarket.com/price?token_id={token_id}"
+        r = requests.get(url, timeout=5).json()
+        return float(r.get("price", 0))
+    except:
+        return 0
 
+# ================= 获取市场 =================
+def get_markets():
+    try:
+        url = "https://clob.polymarket.com/markets"
+        data = requests.get(url, timeout=5).json()
+        return data[:7]  # 只取前7个
+    except:
+        return []
+
+# ================= 主程序 =================
 async def main():
-    logger.info("🚀 启动 Polymarket 极简兼容版 (v0.34.6)...")
-    
-    # 环境变量读取
-    pk = os.getenv("PRIVATE_KEY")
-    token_ids_raw = os.getenv("TEST_TOKEN_ID", "")
-    order_size = float(os.getenv("ORDER_SIZE", "1.0"))
+    logger.info("🚀 实盘套利系统启动...")
 
-    # 1. 初始化客户端
+    # 环境变量
+    pk = os.getenv("PRIVATE_KEY")
+    order_size = float(os.getenv("ORDER_SIZE", "1"))
+
+    # 初始化
     client = ClobClient(
         host="https://clob.polymarket.com",
         key=pk,
-        chain_id=137
+        chain_id=42161  # ✅ Arbitrum
     )
 
-    # 2. 注入凭证
-    try:
-        client.set_api_creds(ApiCreds(
-            api_key=os.getenv("POLY_API_KEY"),
-            api_secret=os.getenv("POLY_SECRET"),
-            api_passphrase=os.getenv("POLY_PASSPHRASE")
-        ))
-        logger.info("🔑 API 凭证载入成功")
-    except Exception as e:
-        logger.error(f"❌ 凭证载入失败: {e}")
+    client.set_api_creds(ApiCreds(
+        api_key=os.getenv("POLY_API_KEY"),
+        api_secret=os.getenv("POLY_SECRET"),
+        api_passphrase=os.getenv("POLY_PASSPHRASE")
+    ))
 
-    # 3. 解析 Token 列表
-    token_list = [t.strip() for t in token_ids_raw.split(",") if len(t.strip()) > 10]
-    
-    if not token_list:
-        logger.error("❌ TEST_TOKEN_ID 为空，请在 Railway 设置。")
-        return
+    logger.info("🔑 API 初始化完成")
 
-    logger.info(f"🏹 准备下单，目标数量: {len(token_list)} 个方向...")
-
-    for t_id in token_list:
-        try:
-            logger.info(f"正在处理 Token: {t_id[-8:]}")
-            
-            # 关键修复：直接使用字典而不是 OrderArgs 对象
-            # 这样可以避开 py-clob-client 内部对 .dict() 的错误调用
-            order_params = {
-                "price": 0.5,
-                "size": order_size,
-                "side": "BUY",
-                "token_id": t_id
-            }
-            
-            # 使用 post_order 提交字典
-            resp = await asyncio.to_thread(client.post_order, order_params)
-            
-            if resp.get("success") or resp.get("status") in ["OK", "success"]:
-                success_msg = f"✅ 下单成功!\nToken: ..{t_id[-6:]}\n价格: 0.5 | 数量: {order_size}"
-                logger.info(success_msg)
-                send_tg(success_msg)
-            else:
-                # 记录拒绝原因，方便排查
-                error_detail = resp.get("error") or resp.get("message") or resp
-                fail_msg = f"❌ 下单拒绝 (..{t_id[-6:]}): {error_detail}"
-                logger.warning(fail_msg)
-                send_tg(fail_msg)
-                
-        except Exception as e:
-            err_msg = f"💥 下单逻辑故障 (..{t_id[-4:]}): {str(e)}"
-            logger.error(err_msg)
-            send_tg(err_msg)
-            
-        await asyncio.sleep(2) # 增加延迟，防止触发频率限制
-
-    logger.info("🏁 本轮初始化下单任务结束。")
     while True:
-        await asyncio.sleep(3600)
+        try:
+            markets = get_markets()
+            logger.info(f"📊 扫描市场数量: {len(markets)}")
 
+            for m in markets:
+                try:
+                    yes_id = m["tokens"][0]["token_id"]
+                    no_id = m["tokens"][1]["token_id"]
+
+                    yes_price = get_price(yes_id)
+                    no_price = get_price(no_id)
+
+                    if yes_price == 0 or no_price == 0:
+                        continue
+
+                    total = yes_price + no_price
+
+                    logger.info(f"🪙 YES:{yes_price} NO:{no_price} SUM:{total}")
+
+                    # ================= 套利逻辑 =================
+                    if total < 0.97:
+                        logger.info("🔥 发现套利机会！")
+
+                        # 买 YES
+                        client.post_order({
+                            "price": round(yes_price, 3),
+                            "size": order_size,
+                            "side": "BUY",
+                            "token_id": yes_id
+                        })
+
+                        # 买 NO
+                        client.post_order({
+                            "price": round(no_price, 3),
+                            "size": order_size,
+                            "side": "BUY",
+                            "token_id": no_id
+                        })
+
+                        msg = f"✅ 套利成功\nYES:{yes_price}\nNO:{no_price}\nSUM:{total}"
+                        send_tg(msg)
+
+                    # ================= 趋势策略 =================
+                    elif yes_price < 0.4:
+                        logger.info("📈 低价买 YES")
+
+                        client.post_order({
+                            "price": round(yes_price, 3),
+                            "size": order_size,
+                            "side": "BUY",
+                            "token_id": yes_id
+                        })
+
+                    elif yes_price > 0.6:
+                        logger.info("📉 高价买 NO")
+
+                        client.post_order({
+                            "price": round(no_price, 3),
+                            "size": order_size,
+                            "side": "BUY",
+                            "token_id": no_id
+                        })
+
+                    await asyncio.sleep(2)
+
+                except Exception as e:
+                    logger.error(f"❌ 单市场错误: {e}")
+
+            logger.info("⏳ 进入下一轮...")
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            logger.error(f"💥 主循环崩溃: {e}")
+            await asyncio.sleep(10)
+
+# ================= 启动 =================
 if __name__ == "__main__":
     asyncio.run(main())
