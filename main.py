@@ -3,9 +3,13 @@ import asyncio
 import requests
 import logging
 import sys
+import time
+from datetime import datetime
 from web3 import Web3
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
 
-# ===== Web3 V6 兼容 =====
+# ===== Web3 兼容 =====
 try:
     from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
 except:
@@ -14,16 +18,14 @@ except:
     except:
         geth_poa_middleware = None
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
+# ================= 配置 =================
+RPC_URL = os.getenv("ALCHEMY_RPC_URL")
+ORDER_SIZE = float(os.getenv("ORDER_SIZE", "1"))
+SPREAD_MIN = 0.01
+REPORT_INTERVAL = 300  # 5分钟
 
-# ================= 日志 =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("LOBSTER-FINAL")
+logger = logging.getLogger("LOBSTER-PRO")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ================= Telegram =================
 def send_tg(msg):
@@ -33,197 +35,177 @@ def send_tg(msg):
         try:
             requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": f"🦞 {msg}"},
+                json={"chat_id": chat_id, "text": msg},
                 timeout=5
             )
         except:
             pass
 
-# ================= RPC =================
-RPC_URL = os.getenv(
-    "ALCHEMY_RPC_URL",
-    "https://polygon-mainnet.g.alchemy.com/v2/duKptaPdJfV8R0-y8-VxY"
-)
-
+# ================= Web3 =================
 async def get_w3():
     while True:
         try:
-            w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
-
+            w3 = Web3(Web3.HTTPProvider(RPC_URL))
             if geth_poa_middleware:
                 try:
                     w3.middleware_onion.inject(geth_poa_middleware, layer=0)
                 except:
                     pass
-
             w3.eth.get_block_number()
-            logger.info("✅ RPC 已连接")
+            logger.info("✅ RPC连接成功")
             return w3
-
         except Exception as e:
             logger.error(f"❌ RPC失败: {e}")
             await asyncio.sleep(10)
 
 # ================= 余额 =================
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-
-ABI = [{
-    "constant": True,
-    "inputs": [{"name": "_owner","type": "address"}],
-    "name": "balanceOf",
-    "outputs": [{"name": "balance","type": "uint256"}],
-    "type": "function"
-}]
+ABI = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
 
 def get_balance(w3):
     try:
         addr = Web3.to_checksum_address(os.getenv("POLY_ADDRESS"))
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(USDC_E),
-            abi=ABI
-        )
-
+        contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=ABI)
         matic = w3.eth.get_balance(addr) / 1e18
         usdc = contract.functions.balanceOf(addr).call() / 1e6
-
-        logger.info(f"💰 资产: {usdc:.2f} USDC | {matic:.4f} MATIC")
         return usdc, matic
-
-    except Exception as e:
-        logger.error(f"❌ 余额失败: {e}")
+    except:
         return 0, 0
 
-# ================= 参数 =================
-SPREAD = 0.03
-ARB_THRESHOLD = 0.98
-
-def calc_size(usdc):
-    if usdc < 20:
-        return 1.0
-    elif usdc < 100:
-        return usdc * 0.1
-    else:
-        return min(usdc * 0.05, 20)
-
+# ================= 市场 =================
 BASE = "https://clob.polymarket.com"
 
-# ================= 市场 =================
 def get_markets():
     try:
         r = requests.get(f"{BASE}/sampling-markets", timeout=10).json()
         data = r if isinstance(r, list) else r.get("data", [])
-        return [m for m in data if "tokens" in m][:6]  # 控制市场数量
+        return data[:5]
     except:
         return []
 
-def get_price(token_id):
+def get_book(token_id):
     try:
         r = requests.get(f"{BASE}/book?token_id={token_id}", timeout=5).json()
+        bids = r.get("bids", [])
         asks = r.get("asks", [])
-        return float(asks[0]["price"]) if asks else 1.0
+        bid = float(bids[0]["price"]) if bids else 0
+        ask = float(asks[0]["price"]) if asks else 1
+        return bid, ask
     except:
-        return 1.0
+        return 0, 1
 
-# ================= 下单 =================
-async def safe_order(client, token_id, price, size, side):
+# ================= 全局统计 =================
+stats = {
+    "orders": 0,
+    "fills": 0,
+    "start_balance": 0,
+    "last_report": time.time()
+}
+
+# ================= 做市逻辑 =================
+async def process_market(client, market):
+    tokens = market.get("tokens", [])
+    if len(tokens) < 2:
+        return
+
+    token = tokens[0]["token_id"]
+
+    bid, ask = get_book(token)
+    if bid == 0 or ask == 1:
+        return
+
+    mid = (bid + ask) / 2
+
+    # 风控：趋势过滤
+    if mid > 0.85 or mid < 0.15:
+        return
+
+    my_bid = round(bid + 0.001, 3)
+    my_ask = round(ask - 0.001, 3)
+
+    spread = my_ask - my_bid
+
+    if spread < SPREAD_MIN:
+        return
+
+    logger.info(f"⚖️ {token[-6:]} 买:{my_bid} 卖:{my_ask} 差:{spread:.3f}")
+
     try:
-        res = await asyncio.to_thread(client.post_order, {
-            "price": round(price, 3),
-            "size": size,
-            "side": side,
-            "token_id": token_id
-        })
-        return res
-    except Exception as e:
-        logger.error(f"❌ 下单失败: {e}")
-        return None
-
-# ================= 核心策略 =================
-async def process_market(client, y_id, n_id, usdc):
-
-    y = get_price(y_id)
-    n = get_price(n_id)
-    total = y + n
-
-    logger.info(f"📈 {y:.3f} + {n:.3f} = {total:.3f}")
-
-    size = calc_size(usdc)
-
-    # ================= 套利 =================
-    if 0.1 < total < ARB_THRESHOLD:
-        logger.info(f"🔥 套利触发 {total:.3f}")
-
-        results = await asyncio.gather(
-            safe_order(client, y_id, y + 0.002, size, "BUY"),
-            safe_order(client, n_id, n + 0.002, size, "BUY")
+        await asyncio.gather(
+            asyncio.to_thread(client.post_order, {
+                "price": my_bid,
+                "size": ORDER_SIZE,
+                "side": "BUY",
+                "token_id": token,
+                "expiration": int(time.time() + 60)
+            }),
+            asyncio.to_thread(client.post_order, {
+                "price": my_ask,
+                "size": ORDER_SIZE,
+                "side": "SELL",
+                "token_id": token,
+                "expiration": int(time.time() + 60)
+            })
         )
+        stats["orders"] += 2
+    except:
+        pass
 
-        if all(results):
-            send_tg(f"💰 套利成功 {total:.3f}")
-        return
+# ================= 电报汇报 =================
+async def report_loop(w3):
+    while True:
+        await asyncio.sleep(REPORT_INTERVAL)
 
-    # ================= 做市 =================
-    if y > 0.85 or y < 0.15:
-        logger.info("⚠️ 趋势过强，跳过")
-        return
+        usdc, matic = get_balance(w3)
+        profit = usdc - stats["start_balance"]
 
-    mid = (y + (1 - n)) / 2
+        msg = f"""🦞 运行报告
+时间: {datetime.now().strftime('%H:%M:%S')}
 
-    buy = max(0.01, mid - SPREAD)
-    sell = min(0.99, mid + SPREAD)
+💰 USDC: {usdc:.2f}
+⛽ MATIC: {matic:.2f}
 
-    await asyncio.gather(
-        safe_order(client, y_id, buy, size, "BUY"),
-        safe_order(client, y_id, sell, size, "SELL")
-    )
+📊 今日收益: {profit:.2f}
+📈 下单次数: {stats["orders"]}
+"""
 
-    logger.info(f"💰 做市: 买{buy:.3f} 卖{sell:.3f}")
+        send_tg(msg)
+        logger.info("📤 已发送电报报告")
 
 # ================= 主程序 =================
 async def main():
-
-    logger.info("🚀 Lobster Final 启动")
+    logger.info("🚀 Lobster-MM Pro 启动")
 
     w3 = await get_w3()
     usdc, matic = get_balance(w3)
 
-    if matic < 0.1:
-        send_tg("⚠️ MATIC 不足")
+    stats["start_balance"] = usdc
 
-    client = ClobClient(
-        host=BASE,
-        key=os.getenv("PRIVATE_KEY"),
-        chain_id=137
-    )
+    send_tg(f"🟢 机器人启动\n余额: {usdc:.2f} USDC")
 
+    client = ClobClient(host=BASE, key=os.getenv("PRIVATE_KEY"), chain_id=137)
     client.set_api_creds(ApiCreds(
         api_key=os.getenv("POLY_API_KEY"),
         api_secret=os.getenv("POLY_SECRET"),
         api_passphrase=os.getenv("POLY_PASSPHRASE")
     ))
 
+    # 启动电报线程
+    asyncio.create_task(report_loop(w3))
+
     while True:
         try:
             markets = get_markets()
-            logger.info(f"🔎 市场数: {len(markets)}")
 
             for m in markets:
-                tokens = m.get("tokens", [])
-                if len(tokens) < 2:
-                    continue
+                await process_market(client, m)
+                await asyncio.sleep(1)
 
-                y_id = tokens[0]["token_id"]
-                n_id = tokens[1]["token_id"]
-
-                await process_market(client, y_id, n_id, usdc)
-                await asyncio.sleep(0.5)
-
-            usdc, matic = get_balance(w3)
-            await asyncio.sleep(20)
+            await asyncio.sleep(10)
 
         except Exception as e:
             logger.error(f"💥 主循环异常: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 # ================= 启动 =================
 if __name__ == "__main__":
