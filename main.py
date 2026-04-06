@@ -6,13 +6,9 @@ from web3 import Web3
 
 # ================= 配置区 =================
 BASE = "https://clob.polymarket.com"
-MIN_ORDER_SIZE = 1.0       
-MAX_ORDER_SIZE = 3.0       
-EDGE_THRESHOLD = 0.006     
-REPORT_INTERVAL = 300      
-
-# 钱包和 RPC
-POLY_RPC = os.getenv("POLY_RPC")  # Polygon RPC URL
+BUY_AMOUNT = 1.0        # 每次投入 1 USDC
+INTERVAL = 300          # 每5分钟触发一次
+POLY_RPC = os.getenv("POLY_RPC")
 POLY_ADDRESS = os.getenv("POLY_ADDRESS")
 PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY")
 
@@ -21,9 +17,9 @@ TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
 # USDC 合约地址 (Polygon)
-USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174") 
+USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 
-# 市场示例
+# 7 个币尾盘反转示例
 MARKETS = {
     "BTC": {"YES": "token_id_yes_btc", "NO": "token_id_no_btc"},
     "ETH": {"YES": "token_id_yes_eth", "NO": "token_id_no_eth"},
@@ -40,27 +36,35 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ================= Web3 初始化 =================
 w3 = Web3(Web3.HTTPProvider(POLY_RPC))
 usdc_contract = w3.eth.contract(address=USDC_ADDRESS, abi=[
-    # 简化 ABI 只用 balanceOf
-    {
-        "constant": True,
-        "inputs": [{"name": "_owner","type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "balance","type": "uint256"}],
-        "type": "function"
-    }
+    {"constant": True,"inputs": [{"name": "_owner","type": "address"}],
+     "name": "balanceOf","outputs": [{"name": "balance","type": "uint256"}],
+     "type": "function"}
 ])
 
-# ================= 动态资金分配 =================
-def calculate_dynamic_size(edge):
-    min_edge = EDGE_THRESHOLD
-    max_edge = 0.02
-    if edge < min_edge:
-        return MIN_ORDER_SIZE
-    elif edge > max_edge:
-        return MAX_ORDER_SIZE
-    else:
-        size = MIN_ORDER_SIZE + (edge - min_edge) / (max_edge - min_edge) * (MAX_ORDER_SIZE - MIN_ORDER_SIZE)
-        return round(size, 2)
+# ================= 获取余额 =================
+def get_balance(address):
+    try:
+        balance = usdc_contract.functions.balanceOf(address).call()
+        return round(balance / 1e6, 2)
+    except:
+        return 0.0
+
+# ================= 获取市场最新价格 =================
+def get_market_price(token_id):
+    try:
+        url = f"{BASE}/trades?token_id={token_id}&limit=1"
+        res = requests.get(url, timeout=5).json()
+        if res and "price" in res[0]:
+            return float(res[0]["price"])
+    except:
+        pass
+    return None
+
+# ================= 下单模拟 =================
+def execute_order(market, side, size):
+    logging.info(f"[下单] {market} | {side} | {size} USDC")
+    # TODO: 替换为实际 Polymarket 下单 API
+    pass
 
 # ================= Telegram =================
 def send_telegram(msg):
@@ -72,61 +76,28 @@ def send_telegram(msg):
         except:
             pass
 
-# ================= 获取余额 =================
-def get_balance(address):
-    try:
-        balance = usdc_contract.functions.balanceOf(address).call()
-        return round(balance / 1e6, 2)  # USDC 6 位小数
-    except:
-        return 0.0
-
-# ================= 获取市场价格 =================
-def get_market_price(token_id):
-    try:
-        url = f"{BASE}/trades?token_id={token_id}&limit=1"
-        res = requests.get(url, timeout=5).json()
-        if res and "price" in res[0]:
-            return float(res[0]["price"])
-    except:
-        pass
-    return None
-
-# ================= 计算 Edge =================
-def calculate_edge(yes_price, no_price):
-    if yes_price is None or no_price is None:
-        return 0
-    return 1 - (yes_price + no_price)
-
-# ================= 下单模拟 =================
-def execute_order(market, side, size):
-    logging.info(f"[下单] {market} | {side} | {size} USDC")
-    # TODO: 调用实际 Polymarket 下单 API
-    pass
-
 # ================= 主循环 =================
 def main():
-    last_report = time.time()
     while True:
         balance = get_balance(POLY_ADDRESS)
         logging.info(f"💰 当前 USDC 余额: {balance} USDC")
-
-        total_edge_count = 0
+        
         for market, tokens in MARKETS.items():
+            # 获取最新价格
             yes_price = get_market_price(tokens["YES"])
             no_price = get_market_price(tokens["NO"])
-            edge = calculate_edge(yes_price, no_price)
 
-            if edge >= EDGE_THRESHOLD:
-                size = calculate_dynamic_size(edge)
-                execute_order(market, "YES", size)
-                execute_order(market, "NO", size)
-                total_edge_count += 1
+            # 尾盘策略: 价格低于 0.01 就买
+            if yes_price and yes_price <= 0.01:
+                execute_order(market, "YES", BUY_AMOUNT)
+            if no_price and no_price <= 0.01:
+                execute_order(market, "NO", BUY_AMOUNT)
 
-        if time.time() - last_report > REPORT_INTERVAL:
-            send_telegram(f"💹 执行 {total_edge_count} 个市场套利订单 | 当前余额 {balance} USDC")
-            last_report = time.time()
+        # Telegram 汇报
+        send_telegram(f"🕔 尾盘反转执行完毕 | 当前余额: {balance} USDC")
 
-        time.sleep(5)
+        # 等待 5 分钟
+        time.sleep(INTERVAL)
 
 if __name__ == "__main__":
     main()
