@@ -4,7 +4,17 @@ import requests
 import logging
 import sys
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+
+# ✅ 兼容 Web3 V5 和 V6+ 的中间件导入
+try:
+    from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
+except ImportError:
+    try:
+        from web3.middleware import geth_poa_middleware
+    except ImportError:
+        # 最后的兜底方案：如果都找不到，定义一个空类防止程序崩溃
+        geth_poa_middleware = None
+
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
@@ -14,7 +24,7 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("LOBSTER-MASTER")
+logger = logging.getLogger("LOBSTER-ULTIMATE")
 
 def send_tg(msg):
     token = os.getenv("TG_TOKEN")
@@ -35,10 +45,11 @@ RPCS = [
 def get_w3():
     for rpc in RPCS:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 5}))
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
             if w3.is_connected():
-                # Polygon 必须注入 PoA 中间件
-                w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                # ✅ 关键：只有在 Polygon 上才注入 PoA 中间件
+                if geth_poa_middleware:
+                    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
                 return w3
         except: continue
     return None
@@ -46,7 +57,7 @@ def get_w3():
 def check_balance(w3):
     try:
         addr = Web3.to_checksum_address(os.getenv("POLY_ADDRESS"))
-        # USDC.e 合约地址
+        # USDC.e 合约地址 (Polygon)
         usdc_contract = w3.eth.contract(
             address=Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
             abi=[{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
@@ -60,48 +71,45 @@ def check_balance(w3):
 
 # ================= 3. 盘口数据抓取 =================
 def get_best_ask(token_id):
-    """获取卖一价，即买入成本"""
+    """获取真实卖一价，即当前吃单成本"""
     try:
         url = f"https://clob.polymarket.com/book?token_id={token_id}"
-        r = requests.get(url, timeout=3).json()
+        r = requests.get(url, timeout=5).json()
         if r.get('asks') and len(r['asks']) > 0:
             return float(r['asks'][0]['price'])
-        return 1.0 # 如果没盘口，返回最大值防止误触发
+        return 1.0 
     except:
         return 1.0
 
 # ================= 4. 核心套利执行 =================
 async def run_arbitrage(client, y_id, n_id, y_ask, n_ask, size):
     try:
-        logger.info(f"🔥 触发对冲! 成本: {y_ask + n_ask:.3f} | 单量: {size}")
+        logger.info(f"🔥 触发对冲! 成本: {y_ask + n_ask:.3f}")
         
-        # 构造两个买单任务
-        # 增加 0.002 冗余价格，确保吃单成交
+        # 同时下达两个买单
         tasks = [
-            asyncio.to_thread(client.post_order, {"price": round(y_ask + 0.002, 3), "size": size, "side": "BUY", "token_id": y_id}),
-            asyncio.to_thread(client.post_order, {"price": round(n_ask + 0.002, 3), "size": size, "side": "BUY", "token_id": n_id})
+            asyncio.to_thread(client.post_order, {"price": round(y_ask + 0.003, 3), "size": size, "side": "BUY", "token_id": y_id}),
+            asyncio.to_thread(client.post_order, {"price": round(n_ask + 0.003, 3), "size": size, "side": "BUY", "token_id": n_id})
         ]
         
         responses = await asyncio.gather(*tasks)
         
-        success_count = 0
-        for resp in responses:
-            if resp.get("success") or resp.get("status") == "OK":
-                success_count += 1
+        success_count = sum(1 for resp in responses if resp.get("success") or resp.get("status") == "OK")
         
         if success_count == 2:
-            send_tg(f"✅ 对冲成功!\n成本: {y_ask + n_ask:.3f}\n收益预期: {1 - (y_ask+n_ask):.3f}")
+            msg = f"✅ 对冲成功!\n成本: {y_ask + n_ask:.3f}\n预计结算利润: {1 - (y_ask+n_ask):.3f}"
+            send_tg(msg)
         elif success_count == 1:
-            send_tg(f"⚠️ 警告: 单边成交! 另一半下单失败，请检查账户。")
+            send_tg(f"⚠️ 严重警告: 单边成交! 请立即检查账户防止裸奔。")
         else:
-            logger.error(f"❌ 全部下单被拒: {responses}")
+            logger.warning(f"❌ 下单均被拒绝: {responses}")
             
     except Exception as e:
         logger.error(f"💥 执行异常: {e}")
 
 # ================= 5. 主循环 =================
 async def main():
-    logger.info("🚀 Lobster-Master 套利系统启动 (实盘 V3)")
+    logger.info("🚀 Lobster-Elite 系统启动 (已应用 Web3 V6 兼容性补丁)")
     
     # 初始化账户
     client = ClobClient(host="https://clob.polymarket.com", key=os.getenv("PRIVATE_KEY"), chain_id=137)
@@ -113,56 +121,51 @@ async def main():
 
     while True:
         try:
-            # 1. 状态自检
+            # 1. 资产探测
             w3 = get_w3()
             if not w3:
-                logger.error("❌ 无法连接 RPC，等待重试...")
+                logger.error("❌ RPC 连接失败，10秒后重试...")
                 await asyncio.sleep(10)
                 continue
                 
             usdc, matic = check_balance(w3)
-            logger.info(f"📊 账户余额: {usdc:.2f} USDC.e | {matic:.4f} MATIC")
+            logger.info(f"📊 钱包状态: {usdc:.2f} USDC.e | {matic:.4f} MATIC")
             
-            if matic < 0.1:
-                logger.warning("🚫 MATIC 不足，可能导致交易失败！")
-
-            # 2. 获取活跃市场（从采样接口获取）
+            # 2. 市场扫描 (获取最新活跃交易对)
             resp = requests.get("https://clob.polymarket.com/sampling-markets", timeout=10).json()
             markets = resp if isinstance(resp, list) else resp.get("data", [])
             
-            for m in markets[:10]: # 扫描前10个活跃市场
+            for m in markets[:12]: # 深度扫描前12个市场
                 try:
                     tokens = m.get("tokens", [])
                     if len(tokens) < 2: continue
                     
                     y_id, n_id = tokens[0]["token_id"], tokens[1]["token_id"]
-                    q_text = m.get("question", "未知市场")
+                    q_text = m.get("question", "未知")
 
-                    # 3. 获取盘口真实成本
+                    # 3. 盘口成本分析
                     y_ask = get_best_ask(y_id)
                     n_ask = get_best_ask(n_id)
                     total_cost = y_ask + n_ask
 
-                    # 4. 套利逻辑触发 (成本 < 0.965)
+                    # 4. 套利逻辑触发 (设定 3.5% 的安全边际)
                     if 0.1 < total_cost < 0.965:
-                        logger.info(f"💎 发现机会: {q_text[:20]} | SUM: {total_cost:.3f}")
+                        logger.info(f"💎 发现机会: {q_text[:20]} | 合计成本: {total_cost:.3f}")
                         
                         order_size = float(os.getenv("ORDER_SIZE", "5.0"))
                         if usdc < (order_size * 2):
-                            logger.warning(f"资金不足，无法执行 {order_size} 规模套利")
+                            logger.warning(f"余额不足，跳过本次执行")
                             continue
                             
                         await run_arbitrage(client, y_id, n_id, y_ask, n_ask, order_size)
-                        await asyncio.sleep(2) # 下单后冷却
+                        await asyncio.sleep(3) # 防止下单过快
 
-                except Exception as e:
-                    continue
+                except Exception: continue
 
-            logger.info("⏳ 扫描轮次结束，等待下一次探测...")
-            await asyncio.sleep(30)
+            await asyncio.sleep(20) # 扫描频率控制
 
         except Exception as e:
-            logger.error(f"💥 主循环系统级异常: {e}")
+            logger.error(f"💥 系统循环异常: {e}")
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
