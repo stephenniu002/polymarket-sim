@@ -1,224 +1,130 @@
-import os
 import time
 import asyncio
-import requests
-import logging
-from web3 import Web3
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
 
-# ================= 配置 =================
-RPC_URL = os.getenv("ALCHEMY_RPC_URL")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-ADDRESS = os.getenv("POLY_ADDRESS")
-
-API_KEY = os.getenv("POLY_API_KEY")
-API_SECRET = os.getenv("POLY_SECRET")
-API_PASS = os.getenv("POLY_PASSPHRASE")
-
-TG_TOKEN = os.getenv("TG_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
-TARGET_PROFIT = 1.0
-MIN_EDGE = 0.01
-PRE_EDGE = 0.005
-
+# ================= 基础参数 =================
+BANKROLL = 100
 ORDER_SIZE = 2
-MAX_POS = 20
-
-REPORT_INTERVAL = 300
-
-profit = 0
-trades = 0
+REPORT_INTERVAL = 300  # 5分钟
 last_report = time.time()
+last_close = time.time()
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("LOBSTER")
+# ================= 工具函数 =================
 
-# ================= 工具 =================
-def send_tg(msg):
-    if not TG_TOKEN:
-        return
+def calc_size_safe(p_yes, p_no):
+    edge = 1 - (p_yes + p_no)
+
+    if edge < 0.005:
+        return 0, 0
+
+    max_capital = BANKROLL * 0.1
+    capital = min(max_capital, edge * 200)
+
+    yes_size = capital * p_no / (p_yes + p_no)
+    no_size = capital - yes_size
+
+    return round(yes_size, 2), round(no_size, 2)
+
+
+def cancel_all():
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg}
-        )
+        client.cancel_all()
     except:
         pass
 
-def get_book(token):
+
+def get_balance():
     try:
-        r = requests.get(f"https://clob.polymarket.com/book?token_id={token}", timeout=3).json()
-        bid = float(r["bids"][0]["price"]) if r["bids"] else 0
-        ask = float(r["asks"][0]["price"]) if r["asks"] else 1
-        return bid, ask
+        return round(usdc_contract.functions.balanceOf(wallet).call() / 1e6, 2)
     except:
-        return 0, 1
+        return 0
 
-def get_markets():
-    try:
-        r = requests.get("https://clob.polymarket.com/sampling-markets", timeout=5).json()
-        return r if isinstance(r, list) else r.get("data", [])
-    except:
-        return []
 
-def calc_orders(p_yes, p_no):
-    edge = 1 - (p_yes + p_no)
-    if edge <= 0:
-        return None
-
-    total = TARGET_PROFIT / edge
-    total = min(total, MAX_POS)
-
-    yes_amt = total * p_no / (p_yes + p_no)
-    no_amt = total - yes_amt
-
-    return yes_amt, no_amt, edge
-
-# ================= 主逻辑 =================
-async def trade_logic(client):
-    global profit, trades, ORDER_SIZE, last_report
-
-    markets = get_markets()[:30]
-
-    for m in markets:
-        tokens = m.get("tokens", [])
-        if len(tokens) < 2:
-            continue
-
-        y = tokens[0]["token_id"]
-        n = tokens[1]["token_id"]
-
-        y_bid, y_ask = get_book(y)
-        n_bid, n_ask = get_book(n)
-
-        total = y_ask + n_ask
-        edge = 1 - total
-
-        log.info(f"📈 {y_ask:.3f}+{n_ask:.3f}={total:.3f} edge={edge:.4f}")
-
-        # ================= 套利 =================
-        if edge > MIN_EDGE:
-            res = calc_orders(y_ask, n_ask)
-            if res:
-                yes_amt, no_amt, edge = res
-
-                log.info(f"🔥 套利执行 edge={edge:.4f}")
-
-                await asyncio.gather(
-                    asyncio.to_thread(client.post_order, {
-                        "price": y_ask,
-                        "size": round(yes_amt, 2),
-                        "side": "BUY",
-                        "token_id": y
-                    }),
-                    asyncio.to_thread(client.post_order, {
-                        "price": n_ask,
-                        "size": round(no_amt, 2),
-                        "side": "BUY",
-                        "token_id": n
-                    })
-                )
-
-                profit += TARGET_PROFIT
-                trades += 1
-
-        # ================= 提前布局 =================
-        elif PRE_EDGE < edge <= MIN_EDGE:
-            log.info("🟡 提前布局")
-
-            await asyncio.to_thread(client.post_order, {
-                "price": y_ask,
-                "size": ORDER_SIZE,
-                "side": "BUY",
-                "token_id": y
-            })
-
-            await asyncio.to_thread(client.post_order, {
-                "price": n_ask,
-                "size": ORDER_SIZE,
-                "side": "BUY",
-                "token_id": n
-            })
-
-        # ================= 单边反手 =================
-        elif y_ask > 0.85:
-            log.info("🔴 单边 → 买 NO")
-
-            await asyncio.to_thread(client.post_order, {
-                "price": n_ask,
-                "size": ORDER_SIZE,
-                "side": "BUY",
-                "token_id": n
-            })
-
-        elif y_ask < 0.15:
-            log.info("🟢 单边 → 买 YES")
-
-            await asyncio.to_thread(client.post_order, {
-                "price": y_ask,
-                "size": ORDER_SIZE,
-                "side": "BUY",
-                "token_id": y
-            })
-
-        # ================= 强制成交 =================
-        else:
-            if 0.3 < y_ask < 0.7:
-                log.info("⚖️ 强制成交")
-
-                await asyncio.to_thread(client.post_order, {
-                    "price": y_ask,
-                    "size": ORDER_SIZE,
-                    "side": "BUY",
-                    "token_id": y
+def close_positions():
+    positions = get_positions()
+    for p in positions:
+        if p["size"] > 0:
+            try:
+                client.post_order({
+                    "price": p["bid"],
+                    "size": p["size"],
+                    "side": "SELL",
+                    "token_id": p["token_id"]
                 })
+            except:
+                pass
 
-        await asyncio.sleep(0.3)
 
-    # ================= 盈利复投 =================
-    if profit > 5:
-        ORDER_SIZE = min(ORDER_SIZE + 0.5, 5)
+def stop_loss():
+    positions = get_positions()
+    for p in positions:
+        if p.get("pnl", 0) < -1:
+            try:
+                client.post_order({
+                    "price": p["bid"],
+                    "size": p["size"],
+                    "side": "SELL",
+                    "token_id": p["token_id"]
+                })
+                print("❌ 止损执行")
+            except:
+                pass
 
-    # ================= Telegram 汇报 =================
-    if time.time() - last_report > REPORT_INTERVAL:
-        msg = f"""
-📊 Lobster 报告
-━━━━━━━━━━
-📈 交易次数: {trades}
-💰 利润: {profit:.2f} USDC
-📦 仓位: {ORDER_SIZE}
-"""
-        send_tg(msg)
-        last_report = time.time()
 
-# ================= 主入口 =================
-async def main():
-    log.info("🚀 Lobster Pro 启动")
+def total_open_position():
+    positions = get_positions()
+    return sum([p["size"] for p in positions])
 
-    w3 = Web3(Web3.HTTPProvider(RPC_URL))
-    log.info("✅ RPC连接成功")
 
-    client = ClobClient(
-        host="https://clob.polymarket.com",
-        key=PRIVATE_KEY,
-        chain_id=137
-    )
+# ================= 主交易逻辑 =================
 
-    client.set_api_creds(ApiCreds(
-        api_key=API_KEY,
-        api_secret=API_SECRET,
-        api_passphrase=API_PASS
-    ))
+async def run():
+    global last_report, last_close, BANKROLL
 
     while True:
         try:
-            await trade_logic(client)
-            await asyncio.sleep(5)
-        except Exception as e:
-            log.error(f"❌ 错误: {e}")
-            await asyncio.sleep(5)
+            markets = get_markets()[:20]
 
-if __name__ == "__main__":
-    asyncio.run(main())
+            for m in markets:
+                tokens = m.get("tokens", [])
+                if len(tokens) < 2:
+                    continue
+
+                y = tokens[0]["token_id"]
+                n = tokens[1]["token_id"]
+
+                y_bid, y_ask = get_book(y)
+                n_bid, n_ask = get_book(n)
+
+                if y_ask == 0 or n_ask == 0:
+                    continue
+
+                edge = 1 - (y_ask + n_ask)
+
+                print(f"📈 {y_ask:.3f} + {n_ask:.3f} = {y_ask+n_ask:.3f}")
+
+                # ====== 仓位控制 ======
+                if total_open_position() > 50:
+                    print("⚠️ 仓位过高，暂停")
+                    continue
+
+                # ================= A. 强套利 =================
+                if edge > 0.015:
+                    yes_size, no_size = calc_size_safe(y_ask, n_ask)
+
+                    if yes_size > 0:
+                        await asyncio.gather(
+                            asyncio.to_thread(client.post_order, {
+                                "price": round(y_ask + 0.001, 3),
+                                "size": yes_size,
+                                "side": "BUY",
+                                "token_id": y
+                            }),
+                            asyncio.to_thread(client.post_order, {
+                                "price": round(n_ask + 0.001, 3),
+                                "size": no_size,
+                                "side": "BUY",
+                                "token_id": n
+                            })
+                        )
+
+                        print(f"💰 强套利 edge={edge:.4f}")
