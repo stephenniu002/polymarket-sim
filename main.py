@@ -1,151 +1,66 @@
-import time
-import requests
+import os
 import logging
+from py_clob_client.client import ClobClient
+from py_clob_client.constants import POLYGON
+from py_clob_client.models import OrderArgs
 
+# 配置日志
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-BASE = "https://clob.polymarket.com"
+# 从环境变量获取私钥 (确保 Railway 中已配置 FOX_PRIVATE_KEY)
+PK = os.getenv("FOX_PRIVATE_KEY")
+client = ClobClient("https://clob.polymarket.com", key=PK, chain_id=POLYGON)
 
-# ==============================
-# 获取当前可交易市场
-# ==============================
-def get_active_market():
+# 精准锁定的市场数据
+MARKETS = {
+    "BTC": {
+        "condition_id": "0x63957bd199b03ae3278a819c2f2c5dbea198b0a33622652e20073a022ed27844",
+        "yes_token": "19504533038661601614761427845353594073359048386377758376510344406121408103328",
+        "no_token": "100412809796016629994645229606869400277259451189445103473130635478442994474328"
+    },
+    "ETH": {
+        "condition_id": "0x34d1e361b687eb4e21195dc26fc4038eb7161a92c9808cab4a231db700518cd6",
+        "yes_token": "788258604446295397235532874107583110586500769147124826906354098610006126507532",
+        "no_token": "10541732733121203809508085133354500369364398888463402012720267766816224605314"
+    }
+}
+
+def execute_real_trade(symbol="BTC", side="BUY", token_type="YES", amount_usd=1.0):
+    """
+    强制执行一笔真实订单
+    """
+    market = MARKETS.get(symbol)
+    token_id = market["yes_token"] if token_type == "YES" else market["no_token"]
+    
+    logger.info(f"🚀 准备下单: {symbol} | 类型: {token_type} | 金额: {amount_usd}U")
+    
     try:
-        res = requests.get(f"{BASE}/markets", timeout=5)
-        data = res.json()
-
-        for m in data:
-            if (
-                m.get("seriesSlug") == "eth-up-or-down-5m"
-                and m.get("acceptingOrders") == True
-                and m.get("active") == True
-                and m.get("closed") == False
-            ):
-                token_ids = eval(m["clobTokenIds"])
-                return {
-                    "name": m["question"],
-                    "up": token_ids[0],
-                    "down": token_ids[1],
-                }
-
-        return None
+        # 获取当前买一卖一价以确保订单成交 (这里演示直接下限价单)
+        # 提示：实际操作中建议先 get_orderbook 确认价格，这里为了演示直接设一个极具竞争力的价格
+        order_args = OrderArgs(
+            price=0.99,   # 这里的价格需根据市场实际情况调整，0.99 几乎肯定成交（如果是买入）
+            size=amount_usd,
+            side=side,
+            token_id=token_id,
+        )
+        
+        # 下单
+        resp = client.create_order(order_args)
+        
+        # 彻底解决之前的 'str' object 报错：先判断类型
+        if isinstance(resp, str):
+            logger.error(f"❌ API 返回错误字符串: {resp}")
+            return
+            
+        if resp.get("success"):
+            logger.info(f"✅ 【真实下单成功】 订单ID: {resp.get('orderID')}")
+        else:
+            logger.warning(f"⚠️ 下单未成功: {resp}")
+            
     except Exception as e:
-        logging.error(f"获取市场失败: {e}")
-        return None
-
-
-# ==============================
-# 获取 orderbook
-# ==============================
-def get_orderbook(token_id):
-    try:
-        url = f"{BASE}/orderbook/{token_id}"
-        res = requests.get(url, timeout=5)
-        return res.json()
-    except:
-        return {}
-
-
-# ==============================
-# 获取价格
-# ==============================
-def get_price(orderbook):
-    try:
-        asks = orderbook.get("asks", [])
-        bids = orderbook.get("bids", [])
-
-        best_ask = float(asks[0]["price"]) if asks else None
-        best_bid = float(bids[0]["price"]) if bids else None
-
-        return best_bid, best_ask
-    except:
-        return None, None
-
-
-# ==============================
-# 策略（套利 / 对冲）
-# ==============================
-def strategy(up_bid, up_ask, down_bid, down_ask):
-    try:
-        if not all([up_ask, down_ask]):
-            return None
-
-        total = up_ask + down_ask
-
-        # 套利机会
-        if total < 0.98:
-            return "ARB"
-
-        # 正常对冲策略
-        if up_ask < 0.4:
-            return "BUY_UP"
-
-        if down_ask < 0.4:
-            return "BUY_DOWN"
-
-        return None
-
-    except:
-        return None
-
-
-# ==============================
-# 下单（你自己接入签名）
-# ==============================
-def execute(action, market):
-    logging.info(f"🚀 执行动作: {action} | {market['name']}")
-
-
-# ==============================
-# 主循环
-# ==============================
-def main():
-    logging.info("🚀 实盘自动交易系统启动")
-
-    current_market = None
-
-    while True:
-        try:
-            market = get_active_market()
-
-            if not market:
-                logging.info("⏳ 等待新市场...")
-                time.sleep(5)
-                continue
-
-            # 市场切换检测
-            if current_market != market["up"]:
-                logging.info(f"🔄 新市场: {market['name']}")
-                current_market = market["up"]
-
-            up_ob = get_orderbook(market["up"])
-            down_ob = get_orderbook(market["down"])
-
-            up_bid, up_ask = get_price(up_ob)
-            down_bid, down_ask = get_price(down_ob)
-
-            # 防止空数据
-            if not all([up_ask, down_ask]):
-                logging.warning("⚠️ 无流动性，跳过")
-                time.sleep(2)
-                continue
-
-            action = strategy(up_bid, up_ask, down_bid, down_ask)
-
-            if action:
-                execute(action, market)
-
-            # 打印监控
-            logging.info(
-                f"UP: {up_bid}/{up_ask} | DOWN: {down_bid}/{down_ask}"
-            )
-
-            time.sleep(2)
-
-        except Exception as e:
-            logging.error(f"❌ 主循环错误: {e}")
-            time.sleep(5)
-
+        logger.error(f"🔥 运行时致命错误: {e}")
 
 if __name__ == "__main__":
-    main()
+    # 立即对 BTC 市场下一单测试
+    execute_real_trade(symbol="BTC", token_type="YES", amount_usd=1.0)
